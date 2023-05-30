@@ -19,15 +19,13 @@ package raft
 
 import (
 	//	"bytes"
-	"math/rand"
-	"sync"
+
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 )
-
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -50,28 +48,85 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+// 日志条目
+type LogEntry struct {
+	Term     int64
+	Commands []interface{}
+}
+
+type ServerStatus uint8
+
+const (
+	Follower  ServerStatus = 0
+	Candidate ServerStatus = 1
+	Leader    ServerStatus = 2
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	// Status
+	Status ServerStatus
 
+	/***** 所有 Server 都包含的持久状态 *****/
+	// CurrentTerm 机器遇到的最大的任期，启动时初始化为 0，单调递增
+	CurrentTerm int
+	// VotedFor 当前任期内投票的 Candidate ID，未投票则为 -1
+	VotedFor int
+	// Logs 日志条目，每个条目都包含了一条状态机指令和 Leader 接收该条目时的任期，index 从 1 开始
+	Logs []*LogEntry
+
+	/***** 所有 Server 都包含的可变状态 *****/
+	// CommitIndex 已知的最大的即将提交的日志索引，启动时初始化为 0，单调递增
+	CommitIndex uint64
+	// LastApplied 最大的已提交的日志索引，启动时初始化为 0，单调递增
+	LastApplied uint64
+
+	/******* Leader 包含的可变状态，选举后初始化 *******/
+	// NextIndex 每台机器下一个要发送的日志条目的索引，初始化为 Leader 最后一个日志索引 +1
+	NextIndex []uint64
+	// MatchIndex 每台机器已知复制的最高的日志条目，初始化为 0，单调递增
+	MatchIndex []uint64
+
+	// 定时器
+	electionTimer  *time.Timer
+	heartbeatTimer *time.Timer
+
+	// 处理 rpc 请求的管道
+	requestVoteChan   chan RequestVoteMsg
+	appendEntriesChan chan AppendEntriesMsg
+
+	// 与拉票协程通信的管道
+	requestVoteResChan chan RequestVoteResMsg
+	// 与追加协程通信的管道
+	appendEntriesResChan chan AppendEntriesResMsg
+
+	// 外部获取服务状态的管道
+	getStateChan chan getStateMsg
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	msg := getStateMsg{
+		ok: make(chan getStateRes),
+	}
+	rf.getStateChan <- msg
+	res := <-msg.ok
+	return res.term, res.isLeader
+}
 
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+type getStateMsg struct {
+	ok chan getStateRes
+}
+
+type getStateRes struct {
+	term     int
+	isLeader bool
 }
 
 // save Raft's persistent state to stable storage,
@@ -91,7 +146,6 @@ func (rf *Raft) persist() {
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
 }
-
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
@@ -113,7 +167,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -122,57 +175,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 
 }
-
-
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (2A).
-}
-
-// example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-}
-
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -192,7 +194,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -217,16 +218,76 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
+		select {
+		case <-rf.electionTimer.C:
+			rf.startElection()
+			resetTimer(rf.electionTimer, RandomizedElectionTimeout())
+		case <-rf.heartbeatTimer.C:
+			rf.broadcastHeartbeat()
+			resetTimer(rf.heartbeatTimer, FixedHeartbeatTimeout())
+		case msg := <-rf.requestVoteChan:
+			rf.handleRequestVote(msg)
+		case msg := <-rf.appendEntriesChan:
+			rf.handleAppendEntries(msg)
+		case msg := <-rf.requestVoteResChan:
+			rf.handleRequestVoteRes(msg)
+		case msg := <-rf.appendEntriesResChan:
+			rf.handleAppendEntriesRes(msg)
+		case msg := <-rf.getStateChan:
+			msg.ok <- getStateRes{
+				term:     rf.CurrentTerm,
+				isLeader: rf.Status == Leader,
+			}
+		}
+	}
+}
 
-		// Your code here (2A)
-		// Check if a leader election should be started.
+func (rf *Raft) startElection() {
+	if rf.Status == Leader {
+		// leader 无需发起新选举
+		return
+	}
+	rf.CurrentTerm += 1
+	// fmt.Printf("server %d start election for term %d\n", rf.me, rf.CurrentTerm)
+	rf.Status = Candidate
+	rf.VotedFor = rf.me
+	args := RequestVoteArgs{
+		Term:         rf.CurrentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.Logs) - 1,
+	}
+	if len(rf.Logs) != 0 {
+		args.LastLogTerm = rf.Logs[len(rf.Logs)-1].Term
+	}
+	meta := ElectionMeta{
+		term: rf.CurrentTerm,
+		yeas: 1,
+		nays: 0,
+	}
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		go rf.sendRequestVoteRoutine(peer, args, &meta)
+	}
+}
 
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+func (rf *Raft) broadcastHeartbeat() {
+	if rf.Status != Leader {
+		return
+	}
+	// fmt.Printf("server %d broadcast heartbeat\n", rf.me)
+	args := AppendEntriesArgs{
+		Term:     rf.CurrentTerm,
+		LeaderID: rf.me,
+	}
+	for peer := range rf.peers {
+		if peer == rf.me {
+			resetTimer(rf.electionTimer, RandomizedElectionTimeout())
+			continue
+		}
+		go rf.sendAppendEntriesRoutine(peer, args)
 	}
 }
 
@@ -246,14 +307,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	rf.Status = Follower
+	rf.VotedFor = -1
+	rf.NextIndex = make([]uint64, len(rf.peers))
+	rf.MatchIndex = make([]uint64, len(rf.peers))
+
 	// Your initialization code here (2A, 2B, 2C).
+
+	rf.electionTimer = time.NewTimer(RandomizedElectionTimeout())
+	rf.heartbeatTimer = time.NewTimer(FixedHeartbeatTimeout())
+
+	rf.requestVoteChan = make(chan RequestVoteMsg)
+	rf.appendEntriesChan = make(chan AppendEntriesMsg)
+	rf.requestVoteResChan = make(chan RequestVoteResMsg)
+	rf.appendEntriesResChan = make(chan AppendEntriesResMsg)
+	rf.getStateChan = make(chan getStateMsg)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
