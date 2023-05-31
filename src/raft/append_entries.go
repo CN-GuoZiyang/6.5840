@@ -75,10 +75,45 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 // 主协程处理追加请求
 func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
-	rf.Status = Follower
+	reply := AppendEntriesReply{}
+	defer func() {
+		msg.ok <- reply
+	}()
 	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
 	rf.rpcTermCheck(msg.req.Term)
-	msg.ok <- AppendEntriesReply{
-		Term: rf.CurrentTerm,
+	if rf.Status != Follower {
+		return
+	}
+	if rf.CurrentTerm > msg.req.Term {
+		return
+	}
+	prevLog := rf.getLog(msg.req.PrevLogIndex)
+	if prevLog == nil {
+		prevLog = &LogEntry{}
+	}
+	if prevLog.Term != msg.req.PrevLogTerm {
+		return
+	}
+	ci := 0
+	for i, e := range msg.req.Entries {
+		for ci < len(rf.Logs) && ci < e.Index {
+			// 寻找到日志追加点
+			ci++
+		}
+		if ci >= len(rf.Logs) {
+			// 接在后面即可
+			rf.Logs = append(rf.Logs, msg.req.Entries[i:]...)
+			break
+		} else if rf.Logs[ci].Term != e.Term {
+			// 截断点位任期不同，直接覆盖后续 log
+			rf.Logs = append(rf.Logs[:ci], msg.req.Entries[i:]...)
+			break
+		}
+	}
+	reply.Success = true
+	// 提交收到的日志
+	if msg.req.LeaderCommit >= rf.CommitIndex {
+		// LeaderCommit 大于自身 Commit，说明传输了可提交 Log
+		rf.commitLog(0, rf.getLatestLog().Index)
 	}
 }

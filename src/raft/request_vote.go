@@ -10,7 +10,7 @@ type RequestVoteArgs struct {
 	// LastLogIndex Candidate 最后一条日志序列的索引
 	LastLogIndex int
 	// LastLogTerm Candidate 最后一条日志序列的任期
-	LastLogTerm int64
+	LastLogTerm int
 }
 
 // 拉票 RPC 响应

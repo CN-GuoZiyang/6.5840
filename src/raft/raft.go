@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -50,7 +51,8 @@ type ApplyMsg struct {
 
 // 日志条目
 type LogEntry struct {
-	Term     int64
+	Index    int
+	Term     int
 	Commands []interface{}
 }
 
@@ -64,10 +66,11 @@ const (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
+	commitCond sync.Cond           // 有日志提交时唤醒
+	peers      []*labrpc.ClientEnd // RPC end points of all peers
+	persister  *Persister          // Object to hold this peer's persisted state
+	me         int                 // this peer's index into peers[]
+	dead       int32               // set by Kill()
 
 	// Status
 	Status ServerStatus
@@ -82,15 +85,15 @@ type Raft struct {
 
 	/***** 所有 Server 都包含的可变状态 *****/
 	// CommitIndex 已知的最大的即将提交的日志索引，启动时初始化为 0，单调递增
-	CommitIndex uint64
+	CommitIndex int
 	// LastApplied 最大的已提交的日志索引，启动时初始化为 0，单调递增
-	LastApplied uint64
+	LastApplied int
 
 	/******* Leader 包含的可变状态，选举后初始化 *******/
 	// NextIndex 每台机器下一个要发送的日志条目的索引，初始化为 Leader 最后一个日志索引 +1
-	NextIndex []uint64
+	NextIndex []int
 	// MatchIndex 每台机器已知复制的最高的日志条目，初始化为 0，单调递增
-	MatchIndex []uint64
+	MatchIndex []int
 
 	// 定时器
 	electionTimer  *time.Timer
@@ -104,6 +107,9 @@ type Raft struct {
 	requestVoteResChan chan RequestVoteResMsg
 	// 与追加协程通信的管道
 	appendEntriesResChan chan AppendEntriesResMsg
+
+	// 处理外部 Command 的管道
+	outerCommandChan chan outerCommandMsg
 
 	// 外部获取服务状态的管道
 	getStateChan chan getStateMsg
@@ -176,28 +182,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
-	return index, term, isLeader
-}
-
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -234,6 +218,8 @@ func (rf *Raft) ticker() {
 			rf.handleRequestVoteRes(msg)
 		case msg := <-rf.appendEntriesResChan:
 			rf.handleAppendEntriesRes(msg)
+		case msg := <-rf.outerCommandChan:
+			rf.handleOuterCommand(msg)
 		case msg := <-rf.getStateChan:
 			msg.ok <- getStateRes{
 				term:     rf.CurrentTerm,
@@ -255,10 +241,8 @@ func (rf *Raft) startElection() {
 	args := RequestVoteArgs{
 		Term:         rf.CurrentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: len(rf.Logs) - 1,
-	}
-	if len(rf.Logs) != 0 {
-		args.LastLogTerm = rf.Logs[len(rf.Logs)-1].Term
+		LastLogIndex: rf.getLatestLog().Index,
+		LastLogTerm:  rf.getLatestLog().Term,
 	}
 	meta := ElectionMeta{
 		term: rf.CurrentTerm,
@@ -273,22 +257,56 @@ func (rf *Raft) startElection() {
 	}
 }
 
+// broadcastHeartbeat 发送心跳包，必须在主协程下调用
 func (rf *Raft) broadcastHeartbeat() {
-	if rf.Status != Leader {
+	if rf.Status != Leader || rf.killed() {
 		return
 	}
 	// fmt.Printf("server %d broadcast heartbeat\n", rf.me)
-	args := AppendEntriesArgs{
-		Term:     rf.CurrentTerm,
-		LeaderID: rf.me,
-	}
 	for peer := range rf.peers {
 		if peer == rf.me {
 			resetTimer(rf.electionTimer, RandomizedElectionTimeout())
+			rf.MatchIndex[peer] = rf.getLatestLog().Index
 			continue
+		}
+
+		prev := rf.NextIndex[peer] - 1
+		args := AppendEntriesArgs{
+			Term:         rf.CurrentTerm,
+			LeaderID:     rf.me,
+			LeaderCommit: rf.CommitIndex,
+		}
+		if prev != -1 {
+			args.PrevLogIndex = rf.Logs[prev].Index
+			args.PrevLogTerm = rf.Logs[prev].Term
+		}
+		if rf.NextIndex[peer] < len(rf.Logs) {
+			args.Entries = rf.Logs[rf.NextIndex[peer]:]
 		}
 		go rf.sendAppendEntriesRoutine(peer, args)
 	}
+}
+
+func (rf *Raft) getLog(index int) *LogEntry {
+	if len(rf.Logs) <= index {
+		return nil
+	}
+	return rf.Logs[index]
+}
+
+func (rf *Raft) getLatestLog() *LogEntry {
+	logEntry := &LogEntry{}
+	if len(rf.Logs) != 0 {
+		logEntry = rf.Logs[len(rf.Logs)-1]
+	}
+	return logEntry
+}
+
+func (rf *Raft) commitLog(l, r int) {
+	if r > rf.CommitIndex {
+		rf.CommitIndex = r
+	}
+	rf.commitCond.Broadcast()
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -303,14 +321,15 @@ func (rf *Raft) broadcastHeartbeat() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
+	rf.commitCond = sync.Cond{L: &sync.Mutex{}}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	rf.Status = Follower
 	rf.VotedFor = -1
-	rf.NextIndex = make([]uint64, len(rf.peers))
-	rf.MatchIndex = make([]uint64, len(rf.peers))
+	rf.NextIndex = make([]int, len(rf.peers))
+	rf.MatchIndex = make([]int, len(rf.peers))
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -321,6 +340,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.appendEntriesChan = make(chan AppendEntriesMsg)
 	rf.requestVoteResChan = make(chan RequestVoteResMsg)
 	rf.appendEntriesResChan = make(chan AppendEntriesResMsg)
+	rf.outerCommandChan = make(chan outerCommandMsg)
 	rf.getStateChan = make(chan getStateMsg)
 
 	// initialize from state persisted before a crash
