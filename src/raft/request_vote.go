@@ -79,7 +79,7 @@ func (rf *Raft) handleRequestVoteRes(msg RequestVoteResMsg) {
 			rf.MatchIndex = make([]int, len(rf.peers))
 			if len(rf.Logs) != 0 {
 				for i := range rf.NextIndex {
-					rf.NextIndex[i] = rf.getLatestLog().Index
+					rf.NextIndex[i] = rf.getLatestLog().Index + 1
 				}
 			}
 			resetTimer(rf.heartbeatTimer, FixedHeartbeatTimeout())

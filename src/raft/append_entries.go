@@ -1,5 +1,9 @@
 package raft
 
+import (
+	"sort"
+)
+
 /********* 追加请求相关数据结构 *********/
 // 追加 RPC 请求
 type AppendEntriesArgs struct {
@@ -27,6 +31,8 @@ type AppendEntriesReply struct {
 
 // 发送追加请求的协程与主协程的通信消息（发送端内部消息）
 type AppendEntriesResMsg struct {
+	peer int
+	args AppendEntriesArgs
 	resp *AppendEntriesReply
 }
 
@@ -51,6 +57,8 @@ func (rf *Raft) sendAppendEntriesRoutine(peer int, args AppendEntriesArgs) {
 		return
 	}
 	rf.appendEntriesResChan <- AppendEntriesResMsg{
+		peer: peer,
+		args: args,
 		resp: &reply,
 	}
 }
@@ -58,7 +66,35 @@ func (rf *Raft) sendAppendEntriesRoutine(peer int, args AppendEntriesArgs) {
 // 主协程处理追加请求返回结果
 func (rf *Raft) handleAppendEntriesRes(msg AppendEntriesResMsg) {
 	resp := msg.resp
-	rf.rpcTermCheck(resp.Term)
+	if !rf.rpcTermCheck(resp.Term) {
+		return
+	}
+	if !resp.Success {
+		return
+	}
+	// 更新对应的 NextIndex 和 MatchIndex
+	last := &LogEntry{Index: msg.args.PrevLogIndex, Term: msg.args.PrevLogTerm}
+	if len(msg.args.Entries) > 0 {
+		// 本次有追加
+		last = msg.args.Entries[len(msg.args.Entries)-1]
+	}
+	rf.MatchIndex[msg.peer] = last.Index
+	rf.NextIndex[msg.peer] = last.Index + 1
+	// 判断是否有 Log 已经达成共识
+	var matchIndexes []int
+	matchIndexes = append(matchIndexes, rf.MatchIndex...)
+	sort.Ints(matchIndexes)
+	allAgree := matchIndexes[len(matchIndexes)/2]
+	entry := rf.getLog(allAgree)
+	if entry == nil {
+		entry = &LogEntry{}
+	}
+	if entry.Index == allAgree {
+		if allAgree != rf.CommitIndex {
+			defer rf.broadcastHeartbeat()
+		}
+		rf.commitLog(rf.CommitIndex, allAgree)
+	}
 }
 
 /********* 追加请求接收端相关方法 *********/

@@ -35,4 +35,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) handleOuterCommand(msg outerCommandMsg) {
 	defer rf.broadcastHeartbeat()
+	index := 0
+	if len(rf.Logs) > 0 {
+		index = rf.getLatestLog().Index + 1
+	}
+	term := rf.CurrentTerm
+	isLeader := rf.Status == Leader
+	res := outerCommandRes{
+		index:    index,
+		term:     term,
+		isLeader: isLeader,
+	}
+	defer func() {
+		msg.ok <- res
+	}()
+	if !isLeader {
+		return
+	}
+	rf.Logs = append(rf.Logs, &LogEntry{Index: index, Term: rf.CurrentTerm, Command: msg.command})
 }

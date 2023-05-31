@@ -20,7 +20,6 @@ package raft
 import (
 	//	"bytes"
 
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -51,9 +50,9 @@ type ApplyMsg struct {
 
 // 日志条目
 type LogEntry struct {
-	Index    int
-	Term     int
-	Commands []interface{}
+	Index   int
+	Term    int
+	Command interface{}
 }
 
 type ServerStatus uint8
@@ -66,11 +65,11 @@ const (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	commitCond sync.Cond           // 有日志提交时唤醒
-	peers      []*labrpc.ClientEnd // RPC end points of all peers
-	persister  *Persister          // Object to hold this peer's persisted state
-	me         int                 // this peer's index into peers[]
-	dead       int32               // set by Kill()
+	peers     []*labrpc.ClientEnd // RPC end points of all peers
+	persister *Persister          // Object to hold this peer's persisted state
+	me        int                 // this peer's index into peers[]
+	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
 	// Status
 	Status ServerStatus
@@ -270,13 +269,13 @@ func (rf *Raft) broadcastHeartbeat() {
 			continue
 		}
 
-		prev := rf.NextIndex[peer] - 1
 		args := AppendEntriesArgs{
 			Term:         rf.CurrentTerm,
 			LeaderID:     rf.me,
 			LeaderCommit: rf.CommitIndex,
 		}
-		if prev != -1 {
+		prev := rf.NextIndex[peer] - 1
+		if prev >= 0 && len(rf.Logs) > prev {
 			args.PrevLogIndex = rf.Logs[prev].Index
 			args.PrevLogTerm = rf.Logs[prev].Term
 		}
@@ -302,11 +301,27 @@ func (rf *Raft) getLatestLog() *LogEntry {
 	return logEntry
 }
 
+// commitLog 提交 l 到 r 区间的 Log，只允许主协程调用
 func (rf *Raft) commitLog(l, r int) {
-	if r > rf.CommitIndex {
-		rf.CommitIndex = r
+	if r <= rf.CommitIndex {
+		return
 	}
-	rf.commitCond.Broadcast()
+	rf.CommitIndex = r
+	for {
+		log := rf.Logs[rf.LastApplied]
+		if log.Index > rf.CommitIndex {
+			break
+		}
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      log.Command,
+			CommandIndex: log.Index,
+		}
+		rf.applyCh <- msg
+		if log.Index > rf.LastApplied {
+			rf.LastApplied = log.Index
+		}
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -321,10 +336,10 @@ func (rf *Raft) commitLog(l, r int) {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
-	rf.commitCond = sync.Cond{L: &sync.Mutex{}}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	rf.Status = Follower
 	rf.VotedFor = -1
