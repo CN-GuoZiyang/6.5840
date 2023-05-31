@@ -75,6 +75,13 @@ func (rf *Raft) handleRequestVoteRes(msg RequestVoteResMsg) {
 		if meta.yeas > len(rf.peers)/2 {
 			// fmt.Printf("server %d become leader for term %d\n", rf.me, rf.CurrentTerm)
 			rf.Status = Leader
+			rf.NextIndex = make([]int, len(rf.peers))
+			rf.MatchIndex = make([]int, len(rf.peers))
+			if len(rf.Logs) != 0 {
+				for i := range rf.NextIndex {
+					rf.NextIndex[i] = rf.getLatestLog().Index
+				}
+			}
 			resetTimer(rf.heartbeatTimer, FixedHeartbeatTimeout())
 			rf.broadcastHeartbeat()
 		}
