@@ -82,14 +82,17 @@ func (rf *Raft) handleAppendEntriesRes(msg AppendEntriesResMsg) {
 		return
 	}
 	// 更新对应的 NextIndex 和 MatchIndex
-	rf.NextIndex[msg.peer] += len(msg.args.Entries)
-	rf.MatchIndex[msg.peer] = rf.NextIndex[msg.peer] - 1
+	if len(msg.args.Entries) != 0 {
+		rf.NextIndex[msg.peer] = msg.args.Entries[len(msg.args.Entries)-1].Index + 1
+		rf.MatchIndex[msg.peer] = rf.NextIndex[msg.peer] - 1
+	}
 	// 判断是否有 Log 已经达成共识
 	var matchIndexes []int
 	matchIndexes = append(matchIndexes, rf.MatchIndex...)
 	sort.Ints(matchIndexes)
 	allAgree := matchIndexes[len(matchIndexes)/2]
 	if allAgree > rf.CommitIndex && rf.getLog(allAgree).Term == rf.CurrentTerm {
+		DPrintf("Index %d reach agree!\n", allAgree)
 		defer rf.broadcastHeartbeat()
 		rf.commitLog(rf.CommitIndex, allAgree)
 	}
@@ -109,7 +112,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 // 主协程处理追加请求
 func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
-	reply := AppendEntriesReply{}
+	reply := AppendEntriesReply{Term: rf.CurrentTerm}
 	defer func() {
 		msg.ok <- reply
 	}()
@@ -131,7 +134,7 @@ func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
 	}
 	for i, e := range msg.req.Entries {
 		index := e.Index
-		if index > len(rf.Logs) {
+		if index >= len(rf.Logs) {
 			rf.Logs = append(rf.Logs, msg.req.Entries[i:]...)
 			break
 		} else if rf.getLog(index).Term != e.Term {
@@ -141,10 +144,10 @@ func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
 		}
 	}
 	reply.Success = true
-	DPrintf("node %d agree to commit %d\n", rf.me, msg.req.LeaderCommit)
 	// 提交收到的日志
 	if msg.req.LeaderCommit > rf.CommitIndex {
 		// LeaderCommit 大于自身 Commit，说明传输了可提交 Log
+		DPrintf("node %d forced commit to %d\n", rf.me, rf.getLatestLog().Index)
 		rf.commitLog(0, rf.getLatestLog().Index)
 	}
 }

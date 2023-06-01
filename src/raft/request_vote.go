@@ -122,6 +122,20 @@ func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 		return
 	}
 	rf.rpcTermCheck(req.Term)
+	if rf.VotedFor != -1 && rf.VotedFor != req.CandidateId {
+		msg.ok <- RequestVoteReply{
+			Term:        rf.CurrentTerm,
+			VoteGranted: false,
+		}
+		return
+	}
+	if req.LastLogTerm < rf.getLatestLog().Term || req.LastLogIndex < rf.getLatestLog().Index {
+		msg.ok <- RequestVoteReply{
+			Term:        rf.CurrentTerm,
+			VoteGranted: false,
+		}
+		return
+	}
 	rf.VotedFor = req.CandidateId
 	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
 	// fmt.Printf("server %d vote for server %d for term %d\n", rf.me, msg.req.CandidateId, req.Term)

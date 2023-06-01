@@ -233,6 +233,7 @@ func (rf *Raft) startElection() {
 		// leader 无需发起新选举
 		return
 	}
+	DPrintf("node %v start election!\n", rf.me)
 	rf.CurrentTerm += 1
 	// fmt.Printf("server %d start election for term %d\n", rf.me, rf.CurrentTerm)
 	rf.Status = Candidate
@@ -284,7 +285,7 @@ func (rf *Raft) broadcastHeartbeat() {
 }
 
 func (rf *Raft) getLog(index int) *LogEntry {
-	if len(rf.Logs) <= index || index == 0 {
+	if len(rf.Logs) <= index {
 		return nil
 	}
 	return rf.Logs[index]
@@ -301,20 +302,15 @@ func (rf *Raft) commitLog(l, r int) {
 	}
 	DPrintf("node %d commit to %d\n", rf.me, r)
 	rf.CommitIndex = r
-	for {
+	for rf.CommitIndex > rf.LastApplied {
+		rf.LastApplied++
 		log := rf.Logs[rf.LastApplied]
-		if log.Index > rf.CommitIndex {
-			break
-		}
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      log.Command,
 			CommandIndex: log.Index,
 		}
 		rf.applyCh <- msg
-		if log.Index > rf.LastApplied {
-			rf.LastApplied = log.Index
-		}
 	}
 }
 

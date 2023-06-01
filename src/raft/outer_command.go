@@ -25,14 +25,10 @@ type outerCommandRes struct {
 // the leader.
 // Start 方法模拟一个外部 command 被提交到本台机器上
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	if rf.Status != Leader {
-		return 0, 0, false
-	}
 	msg := outerCommandMsg{
 		command: command,
 		ok:      make(chan outerCommandRes),
 	}
-	DPrintf("node %d handle start\n", rf.me)
 	rf.outerCommandChan <- msg
 	res := <-msg.ok
 	return res.index, res.term, res.isLeader
@@ -49,10 +45,9 @@ func (rf *Raft) handleOuterCommand(msg outerCommandMsg) {
 		msg.ok <- res
 	}()
 	if !res.isLeader {
-		DPrintf("node %d abandon outer command index %d\n", rf.me, res.index)
 		return
 	}
-	DPrintf("node %d handle outer command index %d\n", rf.me, res.index)
+	DPrintf("node %d handle outer command index %d: %v\n", rf.me, res.index, msg.command)
 	rf.Logs = append(rf.Logs, &LogEntry{Index: res.index, Term: res.term, Command: msg.command})
 	rf.MatchIndex[rf.me] = len(rf.Logs)
 }

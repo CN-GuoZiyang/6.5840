@@ -11,6 +11,7 @@ func (rf *Raft) rpcTermCheck(msgTerm int) bool {
 		rf.CurrentTerm = msgTerm
 		rf.Status = Follower
 		rf.VotedFor = -1
+		DPrintf("node %d become follower for term %d\n", rf.me, rf.CurrentTerm)
 		return false
 	}
 	return true
@@ -28,7 +29,7 @@ func resetTimer(timer *time.Timer, d time.Duration) {
 
 func RandomizedElectionTimeout() time.Duration {
 	rand.Seed(time.Now().UnixNano())
-	return time.Duration(rand.Intn(150)+200) * time.Millisecond
+	return time.Duration(rand.Intn(150)+300) * time.Millisecond
 }
 
 func FixedHeartbeatTimeout() time.Duration {
