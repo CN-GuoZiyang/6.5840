@@ -25,9 +25,14 @@ type outerCommandRes struct {
 // the leader.
 // Start 方法模拟一个外部 command 被提交到本台机器上
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	if rf.Status != Leader {
+		return 0, 0, false
+	}
 	msg := outerCommandMsg{
 		command: command,
+		ok:      make(chan outerCommandRes),
 	}
+	DPrintf("node %d handle start\n", rf.me)
 	rf.outerCommandChan <- msg
 	res := <-msg.ok
 	return res.index, res.term, res.isLeader
@@ -35,22 +40,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) handleOuterCommand(msg outerCommandMsg) {
 	defer rf.broadcastHeartbeat()
-	index := 0
-	if len(rf.Logs) > 0 {
-		index = rf.getLatestLog().Index + 1
-	}
-	term := rf.CurrentTerm
-	isLeader := rf.Status == Leader
 	res := outerCommandRes{
-		index:    index,
-		term:     term,
-		isLeader: isLeader,
+		index:    rf.getLatestLog().Index + 1,
+		term:     rf.CurrentTerm,
+		isLeader: rf.Status == Leader,
 	}
 	defer func() {
 		msg.ok <- res
 	}()
-	if !isLeader {
+	if !res.isLeader {
+		DPrintf("node %d abandon outer command index %d\n", rf.me, res.index)
 		return
 	}
-	rf.Logs = append(rf.Logs, &LogEntry{Index: index, Term: rf.CurrentTerm, Command: msg.command})
+	DPrintf("node %d handle outer command index %d\n", rf.me, res.index)
+	rf.Logs = append(rf.Logs, &LogEntry{Index: res.index, Term: res.term, Command: msg.command})
+	rf.MatchIndex[rf.me] = len(rf.Logs)
 }

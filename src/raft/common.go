@@ -28,7 +28,7 @@ func resetTimer(timer *time.Timer, d time.Duration) {
 
 func RandomizedElectionTimeout() time.Duration {
 	rand.Seed(time.Now().UnixNano())
-	return time.Duration(rand.Intn(150)+300) * time.Millisecond
+	return time.Duration(rand.Intn(150)+200) * time.Millisecond
 }
 
 func FixedHeartbeatTimeout() time.Duration {

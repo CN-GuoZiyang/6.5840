@@ -73,9 +73,12 @@ func (rf *Raft) handleRequestVoteRes(msg RequestVoteResMsg) {
 	if msg.resp.VoteGranted {
 		meta.yeas++
 		if meta.yeas > len(rf.peers)/2 {
-			// fmt.Printf("server %d become leader for term %d\n", rf.me, rf.CurrentTerm)
+			DPrintf("node %d become leader for term %d\n", rf.me, rf.CurrentTerm)
 			rf.Status = Leader
 			rf.NextIndex = make([]int, len(rf.peers))
+			for index := range rf.NextIndex {
+				rf.NextIndex[index] = 1
+			}
 			rf.MatchIndex = make([]int, len(rf.peers))
 			if len(rf.Logs) != 0 {
 				for i := range rf.NextIndex {

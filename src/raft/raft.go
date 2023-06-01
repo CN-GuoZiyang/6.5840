@@ -273,11 +273,8 @@ func (rf *Raft) broadcastHeartbeat() {
 			Term:         rf.CurrentTerm,
 			LeaderID:     rf.me,
 			LeaderCommit: rf.CommitIndex,
-		}
-		prev := rf.NextIndex[peer] - 1
-		if prev >= 0 && len(rf.Logs) > prev {
-			args.PrevLogIndex = rf.Logs[prev].Index
-			args.PrevLogTerm = rf.Logs[prev].Term
+			PrevLogIndex: rf.Logs[rf.NextIndex[peer]-1].Index,
+			PrevLogTerm:  rf.Logs[rf.NextIndex[peer]-1].Term,
 		}
 		if rf.NextIndex[peer] < len(rf.Logs) {
 			args.Entries = rf.Logs[rf.NextIndex[peer]:]
@@ -287,18 +284,14 @@ func (rf *Raft) broadcastHeartbeat() {
 }
 
 func (rf *Raft) getLog(index int) *LogEntry {
-	if len(rf.Logs) <= index {
+	if len(rf.Logs) <= index || index == 0 {
 		return nil
 	}
 	return rf.Logs[index]
 }
 
 func (rf *Raft) getLatestLog() *LogEntry {
-	logEntry := &LogEntry{}
-	if len(rf.Logs) != 0 {
-		logEntry = rf.Logs[len(rf.Logs)-1]
-	}
-	return logEntry
+	return rf.Logs[len(rf.Logs)-1]
 }
 
 // commitLog 提交 l 到 r 区间的 Log，只允许主协程调用
@@ -306,6 +299,7 @@ func (rf *Raft) commitLog(l, r int) {
 	if r <= rf.CommitIndex {
 		return
 	}
+	DPrintf("node %d commit to %d\n", rf.me, r)
 	rf.CommitIndex = r
 	for {
 		log := rf.Logs[rf.LastApplied]
@@ -344,7 +338,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.Status = Follower
 	rf.VotedFor = -1
 	rf.NextIndex = make([]int, len(rf.peers))
+	for index := range rf.NextIndex {
+		rf.NextIndex[index] = 1
+	}
 	rf.MatchIndex = make([]int, len(rf.peers))
+	// 0 位置占位，index 从 1 开始
+	rf.Logs = append(rf.Logs, &LogEntry{})
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -364,5 +363,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
+	DPrintf("node %d start", me)
 	return rf
 }

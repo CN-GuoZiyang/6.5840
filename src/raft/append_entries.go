@@ -66,33 +66,31 @@ func (rf *Raft) sendAppendEntriesRoutine(peer int, args AppendEntriesArgs) {
 // 主协程处理追加请求返回结果
 func (rf *Raft) handleAppendEntriesRes(msg AppendEntriesResMsg) {
 	resp := msg.resp
+	// 如果和发送 rpc 时的任期不一致，则无需处理
+	if rf.CurrentTerm != msg.args.Term {
+		return
+	}
 	if !rf.rpcTermCheck(resp.Term) {
 		return
 	}
 	if !resp.Success {
+		// 同步失败，NextIndex 回退
+		rf.NextIndex[msg.peer]--
+		if rf.NextIndex[msg.peer] < 1 {
+			rf.NextIndex[msg.peer] = 1
+		}
 		return
 	}
 	// 更新对应的 NextIndex 和 MatchIndex
-	last := &LogEntry{Index: msg.args.PrevLogIndex, Term: msg.args.PrevLogTerm}
-	if len(msg.args.Entries) > 0 {
-		// 本次有追加
-		last = msg.args.Entries[len(msg.args.Entries)-1]
-	}
-	rf.MatchIndex[msg.peer] = last.Index
-	rf.NextIndex[msg.peer] = last.Index + 1
+	rf.NextIndex[msg.peer] += len(msg.args.Entries)
+	rf.MatchIndex[msg.peer] = rf.NextIndex[msg.peer] - 1
 	// 判断是否有 Log 已经达成共识
 	var matchIndexes []int
 	matchIndexes = append(matchIndexes, rf.MatchIndex...)
 	sort.Ints(matchIndexes)
 	allAgree := matchIndexes[len(matchIndexes)/2]
-	entry := rf.getLog(allAgree)
-	if entry == nil {
-		entry = &LogEntry{}
-	}
-	if entry.Index == allAgree {
-		if allAgree != rf.CommitIndex {
-			defer rf.broadcastHeartbeat()
-		}
+	if allAgree > rf.CommitIndex && rf.getLog(allAgree).Term == rf.CurrentTerm {
+		defer rf.broadcastHeartbeat()
 		rf.commitLog(rf.CommitIndex, allAgree)
 	}
 }
@@ -116,39 +114,36 @@ func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
 		msg.ok <- reply
 	}()
 	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
+	if rf.CurrentTerm > msg.req.Term {
+		return
+	}
 	rf.rpcTermCheck(msg.req.Term)
 	if rf.Status != Follower {
 		return
 	}
-	if rf.CurrentTerm > msg.req.Term {
-		return
-	}
 	prevLog := rf.getLog(msg.req.PrevLogIndex)
 	if prevLog == nil {
-		prevLog = &LogEntry{}
+		// 本地不存在前一个日志，失败
+		return
 	}
 	if prevLog.Term != msg.req.PrevLogTerm {
 		return
 	}
-	ci := 0
 	for i, e := range msg.req.Entries {
-		for ci < len(rf.Logs) && ci < e.Index {
-			// 寻找到日志追加点
-			ci++
-		}
-		if ci >= len(rf.Logs) {
-			// 接在后面即可
+		index := e.Index
+		if index > len(rf.Logs) {
 			rf.Logs = append(rf.Logs, msg.req.Entries[i:]...)
 			break
-		} else if rf.Logs[ci].Term != e.Term {
-			// 截断点位任期不同，直接覆盖后续 log
-			rf.Logs = append(rf.Logs[:ci], msg.req.Entries[i:]...)
+		} else if rf.getLog(index).Term != e.Term {
+			// 覆盖
+			rf.Logs = append(rf.Logs[:index], msg.req.Entries[i:]...)
 			break
 		}
 	}
 	reply.Success = true
+	DPrintf("node %d agree to commit %d\n", rf.me, msg.req.LeaderCommit)
 	// 提交收到的日志
-	if msg.req.LeaderCommit >= rf.CommitIndex {
+	if msg.req.LeaderCommit > rf.CommitIndex {
 		// LeaderCommit 大于自身 Commit，说明传输了可提交 Log
 		rf.commitLog(0, rf.getLatestLog().Index)
 	}
