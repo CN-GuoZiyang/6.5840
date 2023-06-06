@@ -92,7 +92,7 @@ func (rf *Raft) handleRequestVoteRes(msg RequestVoteResMsg) {
 		meta.nays++
 		rf.rpcTermCheck(msg.resp.Term)
 		if meta.nays > len(rf.peers)/2 {
-			// 反对票超过一半，则该任期选举失败；可以给其他机器投票
+			// 反对票超过一半，则该任期选举失败；允许该任期给其他机器投票
 			rf.VotedFor = -1
 		}
 	}
@@ -129,7 +129,14 @@ func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 		}
 		return
 	}
-	if req.LastLogTerm < rf.getLatestLog().Term || req.LastLogIndex < rf.getLatestLog().Index {
+	if req.LastLogTerm < rf.getLatestLog().Term {
+		msg.ok <- RequestVoteReply{
+			Term:        rf.CurrentTerm,
+			VoteGranted: false,
+		}
+		return
+	}
+	if req.LastLogTerm == rf.getLatestLog().Term && req.LastLogIndex < rf.getLatestLog().Index {
 		msg.ok <- RequestVoteReply{
 			Term:        rf.CurrentTerm,
 			VoteGranted: false,
@@ -138,7 +145,7 @@ func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 	}
 	rf.VotedFor = req.CandidateId
 	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
-	// fmt.Printf("server %d vote for server %d for term %d\n", rf.me, msg.req.CandidateId, req.Term)
+	DPrintf("node %d vote for node %d for term %d\n", rf.me, msg.req.CandidateId, req.Term)
 	msg.ok <- RequestVoteReply{
 		Term:        rf.CurrentTerm,
 		VoteGranted: true,

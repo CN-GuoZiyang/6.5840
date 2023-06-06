@@ -233,8 +233,8 @@ func (rf *Raft) startElection() {
 		// leader 无需发起新选举
 		return
 	}
-	DPrintf("node %v start election!\n", rf.me)
 	rf.CurrentTerm += 1
+	DPrintf("node %v start election for term %d!\n", rf.me, rf.CurrentTerm)
 	// fmt.Printf("server %d start election for term %d\n", rf.me, rf.CurrentTerm)
 	rf.Status = Candidate
 	rf.VotedFor = rf.me
