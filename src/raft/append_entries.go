@@ -143,6 +143,8 @@ func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
 			break
 		}
 	}
+	rf.persist()
+
 	reply.Success = true
 	// 提交收到的日志
 	if msg.req.LeaderCommit > rf.CommitIndex {
