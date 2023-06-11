@@ -27,6 +27,9 @@ type AppendEntriesReply struct {
 	Term int
 	// Success Follower 包含 PrevLogIndex 和 PrevLogTerm 的日志条目为 true
 	Success bool
+	// 如发生冲突拒绝，冲突开始时的 Log 的 Index 和 Term
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // 发送追加请求的协程与主协程的通信消息（发送端内部消息）
@@ -74,10 +77,23 @@ func (rf *Raft) handleAppendEntriesRes(msg AppendEntriesResMsg) {
 		return
 	}
 	if !resp.Success {
-		// 同步失败，NextIndex 回退
-		rf.NextIndex[msg.peer]--
-		if rf.NextIndex[msg.peer] < 1 {
-			rf.NextIndex[msg.peer] = 1
+		// 同步失败，NextIndex 根据 ConflictIndex 回退
+		if resp.ConflictTerm == -1 {
+			// prevLogIndex 位置没有日志，整个重新同步
+			rf.NextIndex[msg.peer] = resp.ConflictIndex
+			return
+		}
+		conflictTermIndex := -1
+		for i := msg.args.PrevLogIndex; i >= 1; i-- {
+			if rf.Logs[i].Term == resp.ConflictTerm {
+				conflictTermIndex = i
+				break
+			}
+		}
+		if conflictTermIndex != -1 {
+			rf.NextIndex[msg.peer] = conflictTermIndex + 1
+		} else {
+			rf.NextIndex[msg.peer] = resp.ConflictIndex
 		}
 		return
 	}
@@ -112,7 +128,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 // 主协程处理追加请求
 func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
-	reply := AppendEntriesReply{Term: rf.CurrentTerm}
+	reply := AppendEntriesReply{Term: rf.CurrentTerm, ConflictIndex: 1, ConflictTerm: -1}
 	defer func() {
 		msg.ok <- reply
 	}()
@@ -121,15 +137,24 @@ func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
 		return
 	}
 	rf.rpcTermCheck(msg.req.Term)
-	if rf.Status != Follower {
-		return
-	}
+	// if rf.Status != Follower {
+	// 	return
+	// }
 	prevLog := rf.getLog(msg.req.PrevLogIndex)
 	if prevLog == nil {
-		// 本地不存在前一个日志，失败
+		// 本地日志长度不存在前序日志，失败
+		reply.ConflictIndex = len(rf.Logs)
 		return
 	}
 	if prevLog.Term != msg.req.PrevLogTerm {
+		reply.ConflictTerm = prevLog.Term
+		// 找到冲突 Term 首次出现的位置
+		for i := 1; i <= msg.req.PrevLogIndex; i++ {
+			if rf.getLog(i).Term == reply.ConflictTerm {
+				reply.ConflictIndex = i
+				break
+			}
+		}
 		return
 	}
 	for i, e := range msg.req.Entries {
