@@ -80,6 +80,7 @@ func (rf *Raft) handleAppendEntriesRes(msg AppendEntriesResMsg) {
 		// 同步失败，NextIndex 根据 ConflictIndex 回退
 		if resp.ConflictTerm == -1 {
 			// prevLogIndex 位置没有日志，整个重新同步
+			DPrintf("Leader %d: Node %d's NextIndex is %d", rf.me, msg.peer, resp.ConflictIndex)
 			rf.NextIndex[msg.peer] = resp.ConflictIndex
 			return
 		}
@@ -99,8 +100,8 @@ func (rf *Raft) handleAppendEntriesRes(msg AppendEntriesResMsg) {
 	}
 	// 更新对应的 NextIndex 和 MatchIndex
 	if len(msg.args.Entries) != 0 {
-		rf.NextIndex[msg.peer] = msg.args.Entries[len(msg.args.Entries)-1].Index + 1
-		rf.MatchIndex[msg.peer] = rf.NextIndex[msg.peer] - 1
+		rf.MatchIndex[msg.peer] = msg.args.PrevLogIndex + len(msg.args.Entries)
+		rf.NextIndex[msg.peer] = rf.MatchIndex[msg.peer] + 1
 	}
 	// 判断是否有 Log 已经达成共识
 	var matchIndexes []int

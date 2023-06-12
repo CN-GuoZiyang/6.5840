@@ -114,8 +114,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // 主协程处理拉票请求
 func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 	req := msg.req
-	if req.Term < rf.CurrentTerm ||
-		(req.Term == rf.CurrentTerm && rf.VotedFor != -1 && rf.VotedFor != req.CandidateId) {
+	if req.Term < rf.CurrentTerm {
 		msg.ok <- RequestVoteReply{
 			Term:        rf.CurrentTerm,
 			VoteGranted: false,
@@ -130,6 +129,7 @@ func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 		}
 		return
 	}
+	DPrintf("Voter %d: Candidate LastLogTerm %d vs my lastLogTerm %d", rf.me, req.LastLogTerm, rf.getLatestLog().Term)
 	if req.LastLogTerm < rf.getLatestLog().Term {
 		msg.ok <- RequestVoteReply{
 			Term:        rf.CurrentTerm,
@@ -137,6 +137,7 @@ func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 		}
 		return
 	}
+	DPrintf("Voter %d: Candidate LastLogIndex %d vs my lastLogIndex %d", rf.me, req.LastLogIndex, rf.getLatestLog().Index)
 	if req.LastLogTerm == rf.getLatestLog().Term && req.LastLogIndex < rf.getLatestLog().Index {
 		msg.ok <- RequestVoteReply{
 			Term:        rf.CurrentTerm,

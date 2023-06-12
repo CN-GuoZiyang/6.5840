@@ -274,6 +274,7 @@ func (rf *Raft) broadcastHeartbeat() {
 		}
 		if rf.NextIndex[peer] < len(rf.Logs) {
 			args.Entries = rf.Logs[rf.NextIndex[peer]:]
+			DPrintf("Leader %d: Sync Node %d Log From %d:%v to %d:%v", rf.me, peer, rf.NextIndex[peer], rf.Logs[rf.NextIndex[peer]], len(rf.Logs)-1, rf.Logs[len(rf.Logs)-1])
 		}
 		go rf.sendAppendEntriesRoutine(peer, args)
 	}
