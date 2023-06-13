@@ -89,6 +89,8 @@ type Raft struct {
 	CommitIndex int
 	// LastApplied 最大的已提交的日志索引，启动时初始化为 0，单调递增
 	LastApplied int
+	// SnapshotData 状态机生成的快照
+	SnapshotData []byte
 
 	/******* Leader 包含的可变状态，选举后初始化 *******/
 	// NextIndex 每台机器下一个要发送的日志条目的索引，初始化为 Leader 最后一个日志索引 +1
@@ -101,8 +103,9 @@ type Raft struct {
 	heartbeatTimer *time.Timer
 
 	// 处理 rpc 请求的管道
-	requestVoteChan   chan RequestVoteMsg
-	appendEntriesChan chan AppendEntriesMsg
+	requestVoteChan     chan RequestVoteMsg
+	appendEntriesChan   chan AppendEntriesMsg
+	installSnapshotChan chan InstallSnapshotMsg
 
 	// 与拉票协程通信的管道
 	requestVoteResChan chan RequestVoteResMsg
@@ -111,6 +114,9 @@ type Raft struct {
 
 	// 处理外部 Command 的管道
 	outerCommandChan chan outerCommandMsg
+
+	// 处理外部 Snapshot 的管道
+	outerSnapshotChan chan outerSnapshotMsg
 
 	// 外部获取服务状态的管道
 	getStateChan chan getStateMsg
@@ -151,7 +157,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.VotedFor)
 	e.Encode(rf.Logs)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.SnapshotData)
 }
 
 // restore previously persisted state.
@@ -164,15 +170,6 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.CurrentTerm)
 	d.Decode(&rf.VotedFor)
 	d.Decode(&rf.Logs)
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -207,12 +204,16 @@ func (rf *Raft) ticker() {
 			rf.handleRequestVote(msg)
 		case msg := <-rf.appendEntriesChan:
 			rf.handleAppendEntries(msg)
+		case msg := <-rf.installSnapshotChan:
+			rf.handleInstallSnapshot(msg)
 		case msg := <-rf.requestVoteResChan:
 			rf.handleRequestVoteRes(msg)
 		case msg := <-rf.appendEntriesResChan:
 			rf.handleAppendEntriesRes(msg)
 		case msg := <-rf.outerCommandChan:
 			rf.handleOuterCommand(msg)
+		case msg := <-rf.outerSnapshotChan:
+			rf.handleOuterSnapshot(msg)
 		case msg := <-rf.getStateChan:
 			msg.ok <- getStateRes{
 				term:     rf.CurrentTerm,
@@ -344,9 +345,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.requestVoteChan = make(chan RequestVoteMsg)
 	rf.appendEntriesChan = make(chan AppendEntriesMsg)
+	rf.installSnapshotChan = make(chan InstallSnapshotMsg)
 	rf.requestVoteResChan = make(chan RequestVoteResMsg)
 	rf.appendEntriesResChan = make(chan AppendEntriesResMsg)
 	rf.outerCommandChan = make(chan outerCommandMsg)
+	rf.outerSnapshotChan = make(chan outerSnapshotMsg)
 	rf.getStateChan = make(chan getStateMsg)
 
 	// initialize from state persisted before a crash
