@@ -34,8 +34,7 @@ func (rf *Raft) handleOuterSnapshot(msg outerSnapshotMsg) {
 		rf.Logs = append(rf.Logs[0:1], rf.Logs[index+1:]...)
 		break
 	}
-	rf.SnapshotData = msg.snapshot
-	rf.persist()
+	rf.persister.Save(rf.stateData(), msg.snapshot)
 }
 
 // Server 发送给 Follower 的同步日志的 RPC
@@ -50,11 +49,45 @@ type InstallSnapshotReply struct {
 	Term int
 }
 
+type InstallSnapshotResMsg struct {
+	peer int
+	args InstallSnapshotArgs
+	resp *InstallSnapshotReply
+}
+
 /********* 安装快照请求发送端相关方法 *********/
-// 安装快照 RPC 发送入口
+// 安装快照发送入口
+func (rf *Raft) sendInstallSnapshotRoutine(peer int, snapshotLog *LogEntry) {
+	args := InstallSnapshotArgs{
+		Term:              rf.CurrentTerm,
+		LastIncludedIndex: snapshotLog.Index,
+		LastIncludedTerm:  snapshotLog.Term,
+		SnapshotData:      rf.persister.ReadSnapshot(),
+	}
+	reply := InstallSnapshotReply{}
+	ok := rf.sendInstallSnapshot(peer, &args, &reply)
+	if !ok {
+		return
+	}
+	rf.installSnapshotResChan <- InstallSnapshotResMsg{
+		peer: peer,
+		args: args,
+		resp: &reply,
+	}
+}
+
+// 安装快照 RPC 发送 RPC
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
+}
+
+func (rf *Raft) handleInstallSnapshotRes(msg InstallSnapshotResMsg) {
+	if !rf.rpcTermCheck(msg.resp.Term) {
+		return
+	}
+	rf.MatchIndex[msg.peer] = msg.args.LastIncludedIndex
+	rf.NextIndex[msg.peer] = msg.args.LastIncludedIndex + 1
 }
 
 /********* 安装快照请求接收端相关方法 *********/
@@ -89,7 +122,7 @@ func (rf *Raft) handleInstallSnapshot(msg InstallSnapshotMsg) {
 		return
 	}
 
-	defer rf.persist()
+	defer rf.persister.Save(rf.stateData(), msg.req.SnapshotData)
 	for index, log := range rf.Logs {
 		if log.Index != msg.req.LastIncludedIndex {
 			continue
@@ -99,7 +132,6 @@ func (rf *Raft) handleInstallSnapshot(msg InstallSnapshotMsg) {
 	}
 	rf.Logs[0].Index = msg.req.LastIncludedIndex
 	rf.Logs[0].Term = msg.req.LastIncludedTerm
-	rf.SnapshotData = msg.req.SnapshotData
 	if rf.LastApplied < msg.req.LastIncludedIndex {
 		rf.LastApplied = msg.req.LastIncludedIndex
 	}

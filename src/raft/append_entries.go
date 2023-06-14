@@ -85,7 +85,11 @@ func (rf *Raft) handleAppendEntriesRes(msg AppendEntriesResMsg) {
 			return
 		}
 		conflictTermIndex := -1
-		for i := msg.args.PrevLogIndex; i >= 1; i-- {
+		for index := msg.args.PrevLogIndex; index >= 1; index-- {
+			i := rf.logIndex2ArrayIndex(index)
+			if i < 0 {
+				break
+			}
 			if rf.Logs[i].Term == resp.ConflictTerm {
 				conflictTermIndex = i
 				break
@@ -108,10 +112,23 @@ func (rf *Raft) handleAppendEntriesRes(msg AppendEntriesResMsg) {
 	matchIndexes = append(matchIndexes, rf.MatchIndex...)
 	sort.Ints(matchIndexes)
 	allAgree := matchIndexes[len(matchIndexes)/2]
-	if allAgree > rf.CommitIndex && rf.getLog(allAgree).Term == rf.CurrentTerm {
+	if allAgree <= rf.CommitIndex {
+		return
+	}
+	allAgreeLog, inSnapshot := rf.getLog(allAgree)
+	if inSnapshot {
+		// allAgree 位于 snapshot 内
 		DPrintf("Index %d reach agree!\n", allAgree)
 		defer rf.broadcastHeartbeat()
-		rf.commitLog(rf.CommitIndex, allAgree)
+		rf.commitLog(allAgree)
+		return
+	}
+	if allAgreeLog.Term == rf.CurrentTerm {
+		// 只有当前任期的日志才需要当前 Server 提交
+		DPrintf("Index %d reach agree!\n", allAgree)
+		defer rf.broadcastHeartbeat()
+		rf.commitLog(allAgree)
+		return
 	}
 }
 
@@ -138,44 +155,71 @@ func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
 		return
 	}
 	rf.rpcTermCheck(msg.req.Term)
-	// if rf.Status != Follower {
-	// 	return
-	// }
-	prevLog := rf.getLog(msg.req.PrevLogIndex)
-	if prevLog == nil {
-		// 本地日志长度不存在前序日志，失败
-		reply.ConflictIndex = len(rf.Logs)
+
+	prevLog, inSnapshot := rf.getLog(msg.req.PrevLogIndex)
+	if prevLog == nil && !inSnapshot {
+		// 本地日志中不存在前序日志，失败
+		reply.ConflictIndex = rf.getLatestIndex() + 1
 		return
 	}
-	if prevLog.Term != msg.req.PrevLogTerm {
-		reply.ConflictTerm = prevLog.Term
-		// 找到冲突 Term 首次出现的位置
-		for i := 1; i <= msg.req.PrevLogIndex; i++ {
-			if rf.getLog(i).Term == reply.ConflictTerm {
-				reply.ConflictIndex = i
+	if inSnapshot {
+		// 前序日志在 snapshot 中，且不是最后一个
+		if msg.req.PrevLogIndex < rf.Logs[0].Index {
+			return
+		}
+		// 前序日志是最后一个，但是冲突
+		if msg.req.PrevLogTerm != rf.Logs[0].Term {
+			return
+		}
+	}
+	if prevLog == nil {
+		prevLog = rf.Logs[0]
+	}
+	// 前序日志不在快照中
+	if !inSnapshot {
+		// 前序日志处无日志
+		lastedIndex := rf.getLatestIndex()
+		if msg.req.PrevLogIndex > lastedIndex {
+			reply.ConflictIndex = lastedIndex + 1
+			return
+		}
+		// 前序日志处日志冲突
+		if prevLog.Term != msg.req.PrevLogTerm {
+			reply.ConflictTerm = prevLog.Term
+			// 找到冲突 Term 首次出现的位置
+			for index := rf.Logs[0].Index + 1; index <= msg.req.PrevLogIndex; index++ {
+				tempLog, _ := rf.getLog(index)
+				if tempLog.Term == reply.ConflictTerm {
+					reply.ConflictIndex = index
+					break
+				}
+			}
+			return
+		}
+	}
+	for i, entry := range msg.req.Entries {
+		index := entry.Index
+		if index > rf.getLatestIndex() {
+			// 超出现有日志长度，直接追加
+			rf.Logs = append(rf.Logs, msg.req.Entries[i:]...)
+			break
+		} else {
+			log, _ := rf.getLog(index)
+			// 存在重叠，直接覆盖
+			if log.Term != entry.Term {
+				rf.Logs = append(rf.Logs[:rf.logIndex2ArrayIndex(index)], msg.req.Entries[i:]...)
 				break
 			}
 		}
-		return
 	}
-	for i, e := range msg.req.Entries {
-		index := e.Index
-		if index >= len(rf.Logs) {
-			rf.Logs = append(rf.Logs, msg.req.Entries[i:]...)
-			break
-		} else if rf.getLog(index).Term != e.Term {
-			// 覆盖
-			rf.Logs = append(rf.Logs[:index], msg.req.Entries[i:]...)
-			break
-		}
-	}
-	rf.persist()
+	rf.persister.SaveOnlyState(rf.stateData())
 
 	reply.Success = true
 	// 提交收到的日志
 	if msg.req.LeaderCommit > rf.CommitIndex {
 		// LeaderCommit 大于自身 Commit，说明传输了可提交 Log
-		DPrintf("node %d forced commit to %d\n", rf.me, rf.getLatestLog().Index)
-		rf.commitLog(0, rf.getLatestLog().Index)
+		newCommitIndex := IfElseInt(rf.getLatestIndex() < msg.req.LeaderCommit, rf.getLatestIndex(), msg.req.LeaderCommit)
+		DPrintf("node %d forced commit to %d\n", rf.me, newCommitIndex)
+		rf.commitLog(newCommitIndex)
 	}
 }

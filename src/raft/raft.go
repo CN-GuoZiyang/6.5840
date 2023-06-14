@@ -89,8 +89,6 @@ type Raft struct {
 	CommitIndex int
 	// LastApplied 最大的已提交的日志索引，启动时初始化为 0，单调递增
 	LastApplied int
-	// SnapshotData 状态机生成的快照
-	SnapshotData []byte
 
 	/******* Leader 包含的可变状态，选举后初始化 *******/
 	// NextIndex 每台机器下一个要发送的日志条目的索引，初始化为 Leader 最后一个日志索引 +1
@@ -111,6 +109,8 @@ type Raft struct {
 	requestVoteResChan chan RequestVoteResMsg
 	// 与追加协程通信的管道
 	appendEntriesResChan chan AppendEntriesResMsg
+	// 与安装快照协程通信的管道
+	installSnapshotResChan chan InstallSnapshotResMsg
 
 	// 处理外部 Command 的管道
 	outerCommandChan chan outerCommandMsg
@@ -142,22 +142,14 @@ type getStateRes struct {
 	isLeader bool
 }
 
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-// before you've implemented snapshots, you should pass nil as the
-// second argument to persister.Save().
-// after you've implemented snapshots, pass the current snapshot
-// (or nil if there's not yet a snapshot).
 // 当需持久化字段变更时，持久化数据
-func (rf *Raft) persist() {
+func (rf *Raft) stateData() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.CurrentTerm)
 	e.Encode(rf.VotedFor)
 	e.Encode(rf.Logs)
-	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, rf.SnapshotData)
+	return w.Bytes()
 }
 
 // restore previously persisted state.
@@ -210,6 +202,8 @@ func (rf *Raft) ticker() {
 			rf.handleRequestVoteRes(msg)
 		case msg := <-rf.appendEntriesResChan:
 			rf.handleAppendEntriesRes(msg)
+		case msg := <-rf.installSnapshotResChan:
+			rf.handleInstallSnapshotRes(msg)
 		case msg := <-rf.outerCommandChan:
 			rf.handleOuterCommand(msg)
 		case msg := <-rf.outerSnapshotChan:
@@ -233,12 +227,12 @@ func (rf *Raft) startElection() {
 	// fmt.Printf("server %d start election for term %d\n", rf.me, rf.CurrentTerm)
 	rf.Status = Candidate
 	rf.VotedFor = rf.me
-	rf.persist()
+	rf.persister.SaveOnlyState(rf.stateData())
 	args := RequestVoteArgs{
 		Term:         rf.CurrentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: rf.getLatestLog().Index,
-		LastLogTerm:  rf.getLatestLog().Term,
+		LastLogIndex: rf.getLatestIndex(),
+		LastLogTerm:  rf.getLatestTerm(),
 	}
 	meta := ElectionMeta{
 		term: rf.CurrentTerm,
@@ -262,7 +256,14 @@ func (rf *Raft) broadcastHeartbeat() {
 	for peer := range rf.peers {
 		if peer == rf.me {
 			resetTimer(rf.electionTimer, RandomizedElectionTimeout())
-			rf.MatchIndex[peer] = rf.getLatestLog().Index
+			rf.MatchIndex[peer] = rf.getLatestIndex()
+			continue
+		}
+
+		snapshotLog := rf.Logs[0]
+		if snapshotLog.Index >= rf.NextIndex[peer] {
+			// 将要发送的 Log 已经淹没在 snapshot 中了~
+			go rf.sendInstallSnapshotRoutine(peer, snapshotLog)
 			continue
 		}
 
@@ -270,38 +271,60 @@ func (rf *Raft) broadcastHeartbeat() {
 			Term:         rf.CurrentTerm,
 			LeaderID:     rf.me,
 			LeaderCommit: rf.CommitIndex,
-			PrevLogIndex: rf.Logs[rf.NextIndex[peer]-1].Index,
-			PrevLogTerm:  rf.Logs[rf.NextIndex[peer]-1].Term,
+		}
+		if snapshotLog.Index == rf.NextIndex[peer] {
+			args.PrevLogIndex, args.PrevLogTerm = snapshotLog.Index, snapshotLog.Term
+		} else {
+			log, _ := rf.getLog(rf.NextIndex[peer] - 1)
+			args.PrevLogIndex, args.PrevLogTerm = log.Index, log.Term
 		}
 		if rf.NextIndex[peer] < len(rf.Logs) {
-			args.Entries = rf.Logs[rf.NextIndex[peer]:]
+			args.Entries = rf.Logs[rf.logIndex2ArrayIndex(rf.NextIndex[peer]):]
 			DPrintf("Leader %d: Sync Node %d Log From %d:%v to %d:%v", rf.me, peer, rf.NextIndex[peer], rf.Logs[rf.NextIndex[peer]], len(rf.Logs)-1, rf.Logs[len(rf.Logs)-1])
 		}
 		go rf.sendAppendEntriesRoutine(peer, args)
 	}
 }
 
-func (rf *Raft) getLog(index int) *LogEntry {
-	if len(rf.Logs) <= index {
-		return nil
-	}
-	return rf.Logs[index]
+func (rf *Raft) logIndex2ArrayIndex(index int) int {
+	return index - rf.Logs[0].Index
 }
 
-func (rf *Raft) getLatestLog() *LogEntry {
-	return rf.Logs[len(rf.Logs)-1]
-}
-
-// commitLog 提交 l 到 r 区间的 Log，只允许主协程调用
-func (rf *Raft) commitLog(l, r int) {
-	if r <= rf.CommitIndex {
+func (rf *Raft) getLog(index int) (log *LogEntry, inSnapshot bool) {
+	i := rf.logIndex2ArrayIndex(index)
+	if i <= 0 {
+		inSnapshot = true
 		return
 	}
+	if len(rf.Logs) <= i {
+		return
+	}
+	log = rf.Logs[i]
+	return
+}
+
+func (rf *Raft) getLatestIndex() int {
+	return rf.Logs[len(rf.Logs)-1].Index
+}
+
+func (rf *Raft) getLatestTerm() int {
+	return rf.Logs[len(rf.Logs)-1].Term
+}
+
+// func (rf *Raft) getLatestLog() *LogEntry {
+// 	return rf.Logs[len(rf.Logs)-1]
+// }
+
+// commitLog 提交 l 到 r 区间的 Log，只允许主协程调用
+func (rf *Raft) commitLog(r int) {
 	DPrintf("node %d commit to %d\n", rf.me, r)
 	rf.CommitIndex = r
 	for rf.CommitIndex > rf.LastApplied {
 		rf.LastApplied++
-		log := rf.Logs[rf.LastApplied]
+		log, inSnapshot := rf.getLog(rf.LastApplied)
+		if inSnapshot {
+			continue
+		}
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      log.Command,
@@ -348,6 +371,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.installSnapshotChan = make(chan InstallSnapshotMsg)
 	rf.requestVoteResChan = make(chan RequestVoteResMsg)
 	rf.appendEntriesResChan = make(chan AppendEntriesResMsg)
+	rf.installSnapshotResChan = make(chan InstallSnapshotResMsg)
 	rf.outerCommandChan = make(chan outerCommandMsg)
 	rf.outerSnapshotChan = make(chan outerSnapshotMsg)
 	rf.getStateChan = make(chan getStateMsg)

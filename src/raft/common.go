@@ -12,7 +12,7 @@ func (rf *Raft) rpcTermCheck(msgTerm int) bool {
 		rf.Status = Follower
 		rf.VotedFor = -1
 		DPrintf("node %d become follower for term %d\n", rf.me, rf.CurrentTerm)
-		rf.persist()
+		rf.persister.SaveOnlyState(rf.stateData())
 		return false
 	}
 	return true
@@ -35,4 +35,11 @@ func RandomizedElectionTimeout() time.Duration {
 
 func FixedHeartbeatTimeout() time.Duration {
 	return time.Millisecond * 100
+}
+
+func IfElseInt(cond bool, a int, b int) int {
+	if cond {
+		return a
+	}
+	return b
 }

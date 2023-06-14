@@ -37,7 +37,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) handleOuterCommand(msg outerCommandMsg) {
 	defer rf.broadcastHeartbeat()
 	res := outerCommandRes{
-		index:    rf.getLatestLog().Index + 1,
+		index:    rf.getLatestIndex() + 1,
 		term:     rf.CurrentTerm,
 		isLeader: rf.Status == Leader,
 	}
@@ -49,6 +49,6 @@ func (rf *Raft) handleOuterCommand(msg outerCommandMsg) {
 	}
 	DPrintf("node %d handle outer command index %d: %v\n", rf.me, res.index, msg.command)
 	rf.Logs = append(rf.Logs, &LogEntry{Index: res.index, Term: res.term, Command: msg.command})
-	rf.persist()
+	rf.persister.SaveOnlyState(rf.stateData())
 	rf.MatchIndex[rf.me] = len(rf.Logs)
 }

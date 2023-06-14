@@ -76,15 +76,10 @@ func (rf *Raft) handleRequestVoteRes(msg RequestVoteResMsg) {
 			DPrintf("node %d become leader for term %d\n", rf.me, rf.CurrentTerm)
 			rf.Status = Leader
 			rf.NextIndex = make([]int, len(rf.peers))
-			for index := range rf.NextIndex {
-				rf.NextIndex[index] = 1
+			for i := range rf.NextIndex {
+				rf.NextIndex[i] = rf.getLatestIndex() + 1
 			}
 			rf.MatchIndex = make([]int, len(rf.peers))
-			if len(rf.Logs) != 0 {
-				for i := range rf.NextIndex {
-					rf.NextIndex[i] = rf.getLatestLog().Index + 1
-				}
-			}
 			resetTimer(rf.heartbeatTimer, FixedHeartbeatTimeout())
 			rf.broadcastHeartbeat()
 		}
@@ -94,7 +89,7 @@ func (rf *Raft) handleRequestVoteRes(msg RequestVoteResMsg) {
 		if meta.nays > len(rf.peers)/2 {
 			// 反对票超过一半，则该任期选举失败；允许该任期给其他机器投票
 			rf.VotedFor = -1
-			rf.persist()
+			rf.persister.SaveOnlyState(rf.stateData())
 		}
 	}
 }
@@ -129,16 +124,16 @@ func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 		}
 		return
 	}
-	DPrintf("Voter %d: Candidate LastLogTerm %d vs my lastLogTerm %d", rf.me, req.LastLogTerm, rf.getLatestLog().Term)
-	if req.LastLogTerm < rf.getLatestLog().Term {
+	DPrintf("Voter %d: Candidate LastLogTerm %d vs my lastLogTerm %d", rf.me, req.LastLogTerm, rf.getLatestTerm())
+	if req.LastLogTerm < rf.getLatestTerm() {
 		msg.ok <- RequestVoteReply{
 			Term:        rf.CurrentTerm,
 			VoteGranted: false,
 		}
 		return
 	}
-	DPrintf("Voter %d: Candidate LastLogIndex %d vs my lastLogIndex %d", rf.me, req.LastLogIndex, rf.getLatestLog().Index)
-	if req.LastLogTerm == rf.getLatestLog().Term && req.LastLogIndex < rf.getLatestLog().Index {
+	DPrintf("Voter %d: Candidate LastLogIndex %d vs my lastLogIndex %d", rf.me, req.LastLogIndex, rf.getLatestIndex())
+	if req.LastLogTerm == rf.getLatestTerm() && req.LastLogIndex < rf.getLatestIndex() {
 		msg.ok <- RequestVoteReply{
 			Term:        rf.CurrentTerm,
 			VoteGranted: false,
@@ -146,7 +141,7 @@ func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 		return
 	}
 	rf.VotedFor = req.CandidateId
-	rf.persist()
+	rf.persister.SaveOnlyState(rf.stateData())
 	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
 	DPrintf("node %d vote for node %d for term %d\n", rf.me, msg.req.CandidateId, req.Term)
 	msg.ok <- RequestVoteReply{
