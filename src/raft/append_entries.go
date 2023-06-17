@@ -1,9 +1,5 @@
 package raft
 
-import (
-	"sort"
-)
-
 /********* 追加请求相关数据结构 *********/
 // 追加 RPC 请求
 type AppendEntriesArgs struct {
@@ -107,29 +103,7 @@ func (rf *Raft) handleAppendEntriesRes(msg AppendEntriesResMsg) {
 		rf.MatchIndex[msg.peer] = msg.args.PrevLogIndex + len(msg.args.Entries)
 		rf.NextIndex[msg.peer] = rf.MatchIndex[msg.peer] + 1
 	}
-	// 判断是否有 Log 已经达成共识
-	var matchIndexes []int
-	matchIndexes = append(matchIndexes, rf.MatchIndex...)
-	sort.Ints(matchIndexes)
-	allAgree := matchIndexes[len(matchIndexes)/2]
-	if allAgree <= rf.CommitIndex {
-		return
-	}
-	allAgreeLog, inSnapshot := rf.getLog(allAgree)
-	if inSnapshot {
-		// allAgree 位于 snapshot 内
-		DPrintf("Index %d reach agree!\n", allAgree)
-		defer rf.broadcastHeartbeat()
-		rf.commitLog(allAgree)
-		return
-	}
-	if allAgreeLog.Term == rf.CurrentTerm {
-		// 只有当前任期的日志才需要当前 Server 提交
-		DPrintf("Index %d reach agree!\n", allAgree)
-		defer rf.broadcastHeartbeat()
-		rf.commitLog(allAgree)
-		return
-	}
+	rf.judgetCommit()
 }
 
 /********* 追加请求接收端相关方法 *********/
@@ -212,7 +186,7 @@ func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
 			}
 		}
 	}
-	rf.persister.SaveOnlyState(rf.stateData())
+	rf.persist()
 
 	reply.Success = true
 	// 提交收到的日志

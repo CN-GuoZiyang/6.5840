@@ -21,20 +21,25 @@ func (rf *Raft) handleOuterSnapshot(msg outerSnapshotMsg) {
 	defer func() {
 		msg.ok <- struct{}{}
 	}()
-	if msg.index <= rf.Logs[0].Index {
+	snapshotLog := rf.Logs[0]
+	if msg.index <= snapshotLog.Index {
 		// 旧快照
 		return
 	}
 	for index, log := range rf.Logs {
-		if log.Index != index {
+		if log.Index != msg.index {
 			continue
 		}
-		rf.Logs[0].Index = index
-		rf.Logs[0].Term = log.Term
-		rf.Logs = append(rf.Logs[0:1], rf.Logs[index+1:]...)
+		snapshotLog.Index = log.Index
+		snapshotLog.Term = log.Term
+		tmpLogs := append(make([]*LogEntry, 0), rf.Logs[0])
+		tmpLogs = append(tmpLogs, rf.Logs[index+1:]...)
+		rf.Logs = tmpLogs
 		break
 	}
-	rf.persister.Save(rf.stateData(), msg.snapshot)
+	rf.snapshot = msg.snapshot
+	rf.persist()
+	DPrintf("Node %d snapshot from index %d", rf.me, msg.index)
 }
 
 // Server 发送给 Follower 的同步日志的 RPC
@@ -88,6 +93,8 @@ func (rf *Raft) handleInstallSnapshotRes(msg InstallSnapshotResMsg) {
 	}
 	rf.MatchIndex[msg.peer] = msg.args.LastIncludedIndex
 	rf.NextIndex[msg.peer] = msg.args.LastIncludedIndex + 1
+	DPrintf("Leader %d: after install snapshot, Node %d ni=%d", rf.me, msg.peer, msg.args.LastIncludedIndex+1)
+	rf.judgetCommit()
 }
 
 /********* 安装快照请求接收端相关方法 *********/
@@ -109,6 +116,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 }
 
 func (rf *Raft) handleInstallSnapshot(msg InstallSnapshotMsg) {
+	DPrintf("Node %d receive installsnapshot: req.LastIncludedIndex %d vs my LastIncludedIndex %d", rf.me, msg.req.LastIncludedIndex, rf.Logs[0].Index)
 	defer func() {
 		msg.ok <- InstallSnapshotReply{Term: rf.CurrentTerm}
 	}()
@@ -117,21 +125,28 @@ func (rf *Raft) handleInstallSnapshot(msg InstallSnapshotMsg) {
 		// 小于当前任期，直接返回
 		return
 	}
+	rf.rpcTermCheck(msg.req.Term)
+
 	if msg.req.LastIncludedIndex <= rf.Logs[0].Index {
 		// 旧快照，无需处理
 		return
 	}
 
-	defer rf.persister.Save(rf.stateData(), msg.req.SnapshotData)
+	defer func() {
+		rf.persist()
+		rf.applySnapshot()
+	}()
 	for index, log := range rf.Logs {
 		if log.Index != msg.req.LastIncludedIndex {
 			continue
 		}
 		rf.Logs = append(rf.Logs[0:1], rf.Logs[index+1:]...)
+		DPrintf("Node %d install snapshot from index %d", rf.me, log.Index)
 		break
 	}
 	rf.Logs[0].Index = msg.req.LastIncludedIndex
 	rf.Logs[0].Term = msg.req.LastIncludedTerm
+	rf.snapshot = msg.req.SnapshotData
 	if rf.LastApplied < msg.req.LastIncludedIndex {
 		rf.LastApplied = msg.req.LastIncludedIndex
 	}

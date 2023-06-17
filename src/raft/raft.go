@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 
 	"bytes"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -89,6 +90,8 @@ type Raft struct {
 	CommitIndex int
 	// LastApplied 最大的已提交的日志索引，启动时初始化为 0，单调递增
 	LastApplied int
+	// snapshot
+	snapshot []byte
 
 	/******* Leader 包含的可变状态，选举后初始化 *******/
 	// NextIndex 每台机器下一个要发送的日志条目的索引，初始化为 Leader 最后一个日志索引 +1
@@ -143,13 +146,13 @@ type getStateRes struct {
 }
 
 // 当需持久化字段变更时，持久化数据
-func (rf *Raft) stateData() []byte {
+func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.CurrentTerm)
 	e.Encode(rf.VotedFor)
 	e.Encode(rf.Logs)
-	return w.Bytes()
+	rf.persister.Save(w.Bytes(), rf.snapshot)
 }
 
 // restore previously persisted state.
@@ -227,7 +230,7 @@ func (rf *Raft) startElection() {
 	// fmt.Printf("server %d start election for term %d\n", rf.me, rf.CurrentTerm)
 	rf.Status = Candidate
 	rf.VotedFor = rf.me
-	rf.persister.SaveOnlyState(rf.stateData())
+	rf.persist()
 	args := RequestVoteArgs{
 		Term:         rf.CurrentTerm,
 		CandidateId:  rf.me,
@@ -263,6 +266,7 @@ func (rf *Raft) broadcastHeartbeat() {
 		snapshotLog := rf.Logs[0]
 		if snapshotLog.Index >= rf.NextIndex[peer] {
 			// 将要发送的 Log 已经淹没在 snapshot 中了~
+			DPrintf("Leader %d: Node %d left too behind! si %d vs ni %d", rf.me, peer, snapshotLog.Index, rf.NextIndex[peer])
 			go rf.sendInstallSnapshotRoutine(peer, snapshotLog)
 			continue
 		}
@@ -275,7 +279,10 @@ func (rf *Raft) broadcastHeartbeat() {
 		if snapshotLog.Index == rf.NextIndex[peer] {
 			args.PrevLogIndex, args.PrevLogTerm = snapshotLog.Index, snapshotLog.Term
 		} else {
-			log, _ := rf.getLog(rf.NextIndex[peer] - 1)
+			log, inSnapshot := rf.getLog(rf.NextIndex[peer] - 1)
+			if inSnapshot {
+				log = rf.Logs[0]
+			}
 			args.PrevLogIndex, args.PrevLogTerm = log.Index, log.Term
 		}
 		if rf.NextIndex[peer] < len(rf.Logs) {
@@ -315,6 +322,25 @@ func (rf *Raft) getLatestTerm() int {
 // 	return rf.Logs[len(rf.Logs)-1]
 // }
 
+func (rf *Raft) judgetCommit() {
+	// 判断是否有 Log 已经达成共识
+	var matchIndexes []int
+	matchIndexes = append(matchIndexes, rf.MatchIndex...)
+	sort.Ints(matchIndexes)
+	allAgree := matchIndexes[len(matchIndexes)/2]
+	if allAgree <= rf.CommitIndex {
+		return
+	}
+	allAgreeLog, inSnapshot := rf.getLog(allAgree)
+	if inSnapshot || allAgreeLog.Term == rf.CurrentTerm {
+		// allAgree 位于 snapshot 内 || 只有当前任期的日志才需要当前 Server 提交
+		DPrintf("Leader %d: Index %d reach agree!\n", rf.me, allAgree)
+		defer rf.broadcastHeartbeat()
+		rf.commitLog(allAgree)
+		return
+	}
+}
+
 // commitLog 提交 l 到 r 区间的 Log，只允许主协程调用
 func (rf *Raft) commitLog(r int) {
 	DPrintf("node %d commit to %d\n", rf.me, r)
@@ -330,8 +356,24 @@ func (rf *Raft) commitLog(r int) {
 			Command:      log.Command,
 			CommandIndex: log.Index,
 		}
+		DPrintf("Node %d: apply %d start", rf.me, rf.LastApplied)
 		rf.applyCh <- msg
+		DPrintf("Node %d: apply %d end", rf.me, rf.LastApplied)
 	}
+}
+
+func (rf *Raft) applySnapshot() {
+	snapshotLog := rf.Logs[0]
+	applyMsg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      rf.persister.ReadSnapshot(),
+		SnapshotTerm:  snapshotLog.Term,
+		SnapshotIndex: snapshotLog.Index,
+	}
+	rf.LastApplied = snapshotLog.Index
+	DPrintf("Node %d: apply start", rf.me)
+	rf.applyCh <- applyMsg
+	DPrintf("Node %d: apply end", rf.me)
 }
 
 // the service or tester wants to create a Raft server. the ports

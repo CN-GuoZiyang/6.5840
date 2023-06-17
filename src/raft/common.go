@@ -12,7 +12,7 @@ func (rf *Raft) rpcTermCheck(msgTerm int) bool {
 		rf.Status = Follower
 		rf.VotedFor = -1
 		DPrintf("node %d become follower for term %d\n", rf.me, rf.CurrentTerm)
-		rf.persister.SaveOnlyState(rf.stateData())
+		rf.persist()
 		return false
 	}
 	return true

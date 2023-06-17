@@ -89,7 +89,7 @@ func (rf *Raft) handleRequestVoteRes(msg RequestVoteResMsg) {
 		if meta.nays > len(rf.peers)/2 {
 			// 反对票超过一半，则该任期选举失败；允许该任期给其他机器投票
 			rf.VotedFor = -1
-			rf.persister.SaveOnlyState(rf.stateData())
+			rf.persist()
 		}
 	}
 }
@@ -124,7 +124,6 @@ func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 		}
 		return
 	}
-	DPrintf("Voter %d: Candidate LastLogTerm %d vs my lastLogTerm %d", rf.me, req.LastLogTerm, rf.getLatestTerm())
 	if req.LastLogTerm < rf.getLatestTerm() {
 		msg.ok <- RequestVoteReply{
 			Term:        rf.CurrentTerm,
@@ -132,7 +131,6 @@ func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 		}
 		return
 	}
-	DPrintf("Voter %d: Candidate LastLogIndex %d vs my lastLogIndex %d", rf.me, req.LastLogIndex, rf.getLatestIndex())
 	if req.LastLogTerm == rf.getLatestTerm() && req.LastLogIndex < rf.getLatestIndex() {
 		msg.ok <- RequestVoteReply{
 			Term:        rf.CurrentTerm,
@@ -141,7 +139,7 @@ func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 		return
 	}
 	rf.VotedFor = req.CandidateId
-	rf.persister.SaveOnlyState(rf.stateData())
+	rf.persist()
 	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
 	DPrintf("node %d vote for node %d for term %d\n", rf.me, msg.req.CandidateId, req.Term)
 	msg.ok <- RequestVoteReply{
