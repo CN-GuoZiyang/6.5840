@@ -91,7 +91,8 @@ type Raft struct {
 	// LastApplied 最大的已提交的日志索引，启动时初始化为 0，单调递增
 	LastApplied int
 	// snapshot
-	snapshot []byte
+	snapshot        []byte
+	waitingSnapshot []byte
 
 	/******* Leader 包含的可变状态，选举后初始化 *******/
 	// NextIndex 每台机器下一个要发送的日志条目的索引，初始化为 Leader 最后一个日志索引 +1
@@ -114,13 +115,13 @@ type Raft struct {
 	appendEntriesResChan chan AppendEntriesResMsg
 	// 与安装快照协程通信的管道
 	installSnapshotResChan chan InstallSnapshotResMsg
+	// applier 获取 msg 的管道
+	applyMsgsChan chan applyMsgsReq
 
 	// 处理外部 Command 的管道
 	outerCommandChan chan outerCommandMsg
-
 	// 处理外部 Snapshot 的管道
 	outerSnapshotChan chan outerSnapshotMsg
-
 	// 外部获取服务状态的管道
 	getStateChan chan getStateMsg
 }
@@ -207,6 +208,8 @@ func (rf *Raft) ticker() {
 			rf.handleAppendEntriesRes(msg)
 		case msg := <-rf.installSnapshotResChan:
 			rf.handleInstallSnapshotRes(msg)
+		case msg := <-rf.applyMsgsChan:
+			rf.getApplyMsgs(msg)
 		case msg := <-rf.outerCommandChan:
 			rf.handleOuterCommand(msg)
 		case msg := <-rf.outerSnapshotChan:
@@ -336,29 +339,8 @@ func (rf *Raft) judgetCommit() {
 		// allAgree 位于 snapshot 内 || 只有当前任期的日志才需要当前 Server 提交
 		DPrintf("Leader %d: Index %d reach agree!\n", rf.me, allAgree)
 		defer rf.broadcastHeartbeat()
-		rf.commitLog(allAgree)
+		rf.CommitIndex = allAgree
 		return
-	}
-}
-
-// commitLog 提交 l 到 r 区间的 Log，只允许主协程调用
-func (rf *Raft) commitLog(r int) {
-	DPrintf("node %d commit to %d\n", rf.me, r)
-	rf.CommitIndex = r
-	for rf.CommitIndex > rf.LastApplied {
-		rf.LastApplied++
-		log, inSnapshot := rf.getLog(rf.LastApplied)
-		if inSnapshot {
-			continue
-		}
-		msg := ApplyMsg{
-			CommandValid: true,
-			Command:      log.Command,
-			CommandIndex: log.Index,
-		}
-		DPrintf("Node %d: apply %d start", rf.me, rf.LastApplied)
-		rf.applyCh <- msg
-		DPrintf("Node %d: apply %d end", rf.me, rf.LastApplied)
 	}
 }
 
@@ -414,6 +396,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.requestVoteResChan = make(chan RequestVoteResMsg)
 	rf.appendEntriesResChan = make(chan AppendEntriesResMsg)
 	rf.installSnapshotResChan = make(chan InstallSnapshotResMsg)
+	rf.applyMsgsChan = make(chan applyMsgsReq)
 	rf.outerCommandChan = make(chan outerCommandMsg)
 	rf.outerSnapshotChan = make(chan outerSnapshotMsg)
 	rf.getStateChan = make(chan getStateMsg)
@@ -423,6 +406,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	// start applier goroutine to start apply logs
+	go rf.applier()
 
 	DPrintf("node %d start", me)
 	return rf

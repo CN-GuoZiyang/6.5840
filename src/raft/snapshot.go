@@ -125,6 +125,7 @@ func (rf *Raft) handleInstallSnapshot(msg InstallSnapshotMsg) {
 		// 小于当前任期，直接返回
 		return
 	}
+	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
 	rf.rpcTermCheck(msg.req.Term)
 
 	if msg.req.LastIncludedIndex <= rf.Logs[0].Index {
@@ -134,7 +135,6 @@ func (rf *Raft) handleInstallSnapshot(msg InstallSnapshotMsg) {
 
 	defer func() {
 		rf.persist()
-		rf.applySnapshot()
 	}()
 	for index, log := range rf.Logs {
 		if log.Index != msg.req.LastIncludedIndex {
@@ -147,6 +147,8 @@ func (rf *Raft) handleInstallSnapshot(msg InstallSnapshotMsg) {
 	rf.Logs[0].Index = msg.req.LastIncludedIndex
 	rf.Logs[0].Term = msg.req.LastIncludedTerm
 	rf.snapshot = msg.req.SnapshotData
+	rf.waitingSnapshot = msg.req.SnapshotData
+
 	if rf.LastApplied < msg.req.LastIncludedIndex {
 		rf.LastApplied = msg.req.LastIncludedIndex
 	}

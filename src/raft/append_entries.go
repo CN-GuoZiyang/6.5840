@@ -124,10 +124,10 @@ func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
 	defer func() {
 		msg.ok <- reply
 	}()
-	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
 	if rf.CurrentTerm > msg.req.Term {
 		return
 	}
+	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
 	rf.rpcTermCheck(msg.req.Term)
 
 	prevLog, inSnapshot := rf.getLog(msg.req.PrevLogIndex)
@@ -194,6 +194,6 @@ func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
 		// LeaderCommit 大于自身 Commit，说明传输了可提交 Log
 		newCommitIndex := IfElseInt(rf.getLatestIndex() < msg.req.LeaderCommit, rf.getLatestIndex(), msg.req.LeaderCommit)
 		DPrintf("node %d forced commit to %d\n", rf.me, newCommitIndex)
-		rf.commitLog(newCommitIndex)
+		rf.CommitIndex = newCommitIndex
 	}
 }
