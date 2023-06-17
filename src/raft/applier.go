@@ -20,7 +20,7 @@ func (rf *Raft) applier() {
 		for _, msg := range res.applyMsgs {
 			rf.applyCh <- msg
 		}
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -29,14 +29,14 @@ func (rf *Raft) getApplyMsgs(msg applyMsgsReq) {
 	defer func() {
 		msg.ok <- applyMsgsRes{applyMsgs: applyMsgs}
 	}()
-	if rf.waitingSnapshot != nil {
+	if rf.snapshotNeedApply {
 		applyMsgs = append(applyMsgs, ApplyMsg{
 			SnapshotValid: true,
-			Snapshot:      rf.waitingSnapshot,
+			Snapshot:      rf.snapshot,
 			SnapshotIndex: rf.Logs[0].Index,
 			SnapshotTerm:  rf.Logs[0].Term,
 		})
-		rf.waitingSnapshot = nil
+		rf.snapshotNeedApply = false
 	} else {
 		for rf.CommitIndex > rf.LastApplied {
 			rf.LastApplied++

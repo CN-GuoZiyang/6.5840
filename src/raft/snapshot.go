@@ -26,6 +26,10 @@ func (rf *Raft) handleOuterSnapshot(msg outerSnapshotMsg) {
 		// 旧快照
 		return
 	}
+	if msg.index > rf.CommitIndex {
+		// 不允许压缩尚未提交的日志
+		return
+	}
 	for index, log := range rf.Logs {
 		if log.Index != msg.index {
 			continue
@@ -38,6 +42,7 @@ func (rf *Raft) handleOuterSnapshot(msg outerSnapshotMsg) {
 		break
 	}
 	rf.snapshot = msg.snapshot
+	rf.snapshotNeedApply = false
 	rf.persist()
 	DPrintf("Node %d snapshot from index %d", rf.me, msg.index)
 }
@@ -136,23 +141,33 @@ func (rf *Raft) handleInstallSnapshot(msg InstallSnapshotMsg) {
 	defer func() {
 		rf.persist()
 	}()
-	for index, log := range rf.Logs {
-		if log.Index != msg.req.LastIncludedIndex {
-			continue
+	if msg.req.LastIncludedIndex < rf.getLatestIndex() {
+		// 快照外还有日志，截断
+		if rf.Logs[rf.logIndex2ArrayIndex(msg.req.LastIncludedIndex)].Term != msg.req.LastIncludedTerm {
+			// 截断处 term 冲突
+			rf.Logs = append(make([]*LogEntry, 0), rf.Logs[0])
+		} else {
+			// 截断
+			leftLog := append(make([]*LogEntry, 0), rf.Logs[0])
+			leftLog = append(leftLog, rf.Logs[rf.logIndex2ArrayIndex(msg.req.LastIncludedIndex)+1:]...)
+			rf.Logs = leftLog
 		}
-		rf.Logs = append(rf.Logs[0:1], rf.Logs[index+1:]...)
-		DPrintf("Node %d install snapshot from index %d", rf.me, log.Index)
-		break
+	} else {
+		rf.Logs = append(make([]*LogEntry, 0), rf.Logs[0])
 	}
+	DPrintf("Node %d install snapshot end to index %d", rf.me, msg.req.LastIncludedIndex)
+
 	rf.Logs[0].Index = msg.req.LastIncludedIndex
 	rf.Logs[0].Term = msg.req.LastIncludedTerm
 	rf.snapshot = msg.req.SnapshotData
-	rf.waitingSnapshot = msg.req.SnapshotData
+	rf.snapshotNeedApply = true
 
 	if rf.LastApplied < msg.req.LastIncludedIndex {
 		rf.LastApplied = msg.req.LastIncludedIndex
+		DPrintf("Node %d lasted applied %d", rf.me, rf.LastApplied)
 	}
 	if rf.CommitIndex < msg.req.LastIncludedIndex {
 		rf.CommitIndex = msg.req.LastIncludedIndex
+		DPrintf("Node %d commit index %d", rf.me, rf.CommitIndex)
 	}
 }

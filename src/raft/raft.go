@@ -91,8 +91,8 @@ type Raft struct {
 	// LastApplied 最大的已提交的日志索引，启动时初始化为 0，单调递增
 	LastApplied int
 	// snapshot
-	snapshot        []byte
-	waitingSnapshot []byte
+	snapshot          []byte
+	snapshotNeedApply bool
 
 	/******* Leader 包含的可变状态，选举后初始化 *******/
 	// NextIndex 每台机器下一个要发送的日志条目的索引，初始化为 Leader 最后一个日志索引 +1
@@ -288,9 +288,10 @@ func (rf *Raft) broadcastHeartbeat() {
 			}
 			args.PrevLogIndex, args.PrevLogTerm = log.Index, log.Term
 		}
-		if rf.NextIndex[peer] < len(rf.Logs) {
-			args.Entries = rf.Logs[rf.logIndex2ArrayIndex(rf.NextIndex[peer]):]
-			DPrintf("Leader %d: Sync Node %d Log From %d:%v to %d:%v", rf.me, peer, rf.NextIndex[peer], rf.Logs[rf.NextIndex[peer]], len(rf.Logs)-1, rf.Logs[len(rf.Logs)-1])
+		startLog, _ := rf.getLog(rf.NextIndex[peer])
+		if startLog != nil {
+			args.Entries = rf.Logs[rf.logIndex2ArrayIndex(startLog.Index):]
+			DPrintf("Leader %d: Sync Node %d Log From %d:%v to %d:%v", rf.me, peer, startLog.Index, startLog, len(rf.Logs)-1, rf.Logs[len(rf.Logs)-1])
 		}
 		go rf.sendAppendEntriesRoutine(peer, args)
 	}
@@ -403,6 +404,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.snapshot = rf.persister.ReadSnapshot()
+	rf.LastApplied = rf.Logs[0].Index
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
