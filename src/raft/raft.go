@@ -101,8 +101,9 @@ type Raft struct {
 	MatchIndex []int
 
 	// 定时器
-	electionTimer  *time.Timer
-	heartbeatTimer *time.Timer
+	electionTimeout  time.Time
+	heartbeatTimeout time.Time
+	timerChan        chan timerMsg
 
 	// 处理 rpc 请求的管道
 	requestVoteChan     chan RequestVoteMsg
@@ -190,12 +191,14 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		select {
-		case <-rf.electionTimer.C:
-			rf.startElection()
-			resetTimer(rf.electionTimer, RandomizedElectionTimeout())
-		case <-rf.heartbeatTimer.C:
-			rf.broadcastHeartbeat()
-			resetTimer(rf.heartbeatTimer, FixedHeartbeatTimeout())
+		case msg := <-rf.timerChan:
+			rf.handleTimer(msg)
+		// case <-rf.electionTimer.C:
+		// 	rf.startElection()
+		// 	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
+		// case <-rf.heartbeatTimer.C:
+		// 	rf.broadcastHeartbeat()
+		// 	resetTimer(rf.heartbeatTimer, FixedHeartbeatTimeout())
 		case msg := <-rf.requestVoteChan:
 			rf.handleRequestVote(msg)
 		case msg := <-rf.appendEntriesChan:
@@ -261,7 +264,7 @@ func (rf *Raft) broadcastHeartbeat() {
 	// fmt.Printf("server %d broadcast heartbeat\n", rf.me)
 	for peer := range rf.peers {
 		if peer == rf.me {
-			resetTimer(rf.electionTimer, RandomizedElectionTimeout())
+			rf.resetElectionTimeout()
 			rf.MatchIndex[peer] = rf.getLatestIndex()
 			continue
 		}
@@ -386,10 +389,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 0 位置占位，index 从 1 开始
 	rf.Logs = append(rf.Logs, &LogEntry{})
 
-	// Your initialization code here (2A, 2B, 2C).
-
-	rf.electionTimer = time.NewTimer(RandomizedElectionTimeout())
-	rf.heartbeatTimer = time.NewTimer(FixedHeartbeatTimeout())
+	rf.timerChan = make(chan timerMsg)
+	rf.resetElectionTimeout()
+	rf.resetHeartbeatTimeout()
 
 	rf.requestVoteChan = make(chan RequestVoteMsg)
 	rf.appendEntriesChan = make(chan AppendEntriesMsg)
@@ -412,6 +414,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start applier goroutine to start apply logs
 	go rf.applier()
+
+	// start timer
+	go rf.timer()
 
 	DPrintf("node %d start", me)
 	return rf

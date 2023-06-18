@@ -130,7 +130,7 @@ func (rf *Raft) handleInstallSnapshot(msg InstallSnapshotMsg) {
 		// 小于当前任期，直接返回
 		return
 	}
-	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
+	rf.resetElectionTimeout()
 	rf.rpcTermCheck(msg.req.Term)
 
 	if msg.req.LastIncludedIndex <= rf.Logs[0].Index {

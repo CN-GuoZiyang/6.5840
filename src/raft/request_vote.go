@@ -80,7 +80,7 @@ func (rf *Raft) handleRequestVoteRes(msg RequestVoteResMsg) {
 				rf.NextIndex[i] = rf.getLatestIndex() + 1
 			}
 			rf.MatchIndex = make([]int, len(rf.peers))
-			resetTimer(rf.heartbeatTimer, FixedHeartbeatTimeout())
+			rf.resetHeartbeatTimeout()
 			rf.broadcastHeartbeat()
 		}
 	} else {
@@ -140,7 +140,7 @@ func (rf *Raft) handleRequestVote(msg RequestVoteMsg) {
 	}
 	rf.VotedFor = req.CandidateId
 	rf.persist()
-	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
+	rf.resetElectionTimeout()
 	DPrintf("node %d vote for node %d for term %d\n", rf.me, msg.req.CandidateId, req.Term)
 	msg.ok <- RequestVoteReply{
 		Term:        rf.CurrentTerm,
