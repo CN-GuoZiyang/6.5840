@@ -35,7 +35,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) handleOuterCommand(msg outerCommandMsg) {
-	defer rf.broadcastHeartbeat()
 	res := outerCommandRes{
 		index:    rf.getLatestIndex() + 1,
 		term:     rf.CurrentTerm,
