@@ -188,17 +188,11 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
+func (rf *Raft) mainRoutine() {
 	for !rf.killed() {
 		select {
 		case msg := <-rf.timerChan:
 			rf.handleTimer(msg)
-		// case <-rf.electionTimer.C:
-		// 	rf.startElection()
-		// 	resetTimer(rf.electionTimer, RandomizedElectionTimeout())
-		// case <-rf.heartbeatTimer.C:
-		// 	rf.broadcastHeartbeat()
-		// 	resetTimer(rf.heartbeatTimer, FixedHeartbeatTimeout())
 		case msg := <-rf.requestVoteChan:
 			rf.handleRequestVote(msg)
 		case msg := <-rf.appendEntriesChan:
@@ -325,10 +319,6 @@ func (rf *Raft) getLatestTerm() int {
 	return rf.Logs[len(rf.Logs)-1].Term
 }
 
-// func (rf *Raft) getLatestLog() *LogEntry {
-// 	return rf.Logs[len(rf.Logs)-1]
-// }
-
 func (rf *Raft) judgetCommit() {
 	// 判断是否有 Log 已经达成共识
 	var matchIndexes []int
@@ -346,20 +336,6 @@ func (rf *Raft) judgetCommit() {
 		rf.CommitIndex = allAgree
 		return
 	}
-}
-
-func (rf *Raft) applySnapshot() {
-	snapshotLog := rf.Logs[0]
-	applyMsg := ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      rf.persister.ReadSnapshot(),
-		SnapshotTerm:  snapshotLog.Term,
-		SnapshotIndex: snapshotLog.Index,
-	}
-	rf.LastApplied = snapshotLog.Index
-	DPrintf("Node %d: apply start", rf.me)
-	rf.applyCh <- applyMsg
-	DPrintf("Node %d: apply end", rf.me)
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -409,8 +385,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.snapshot = rf.persister.ReadSnapshot()
 	rf.LastApplied = rf.Logs[0].Index
 
-	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.mainRoutine()
 
 	// start applier goroutine to start apply logs
 	go rf.applier()
