@@ -50,6 +50,7 @@ func (rf *Raft) handleOuterSnapshot(msg outerSnapshotMsg) {
 // Server 发送给 Follower 的同步日志的 RPC
 type InstallSnapshotArgs struct {
 	Term              int
+	LeaderID          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	SnapshotData      []byte
@@ -70,6 +71,7 @@ type InstallSnapshotResMsg struct {
 func (rf *Raft) sendInstallSnapshotRoutine(peer int, snapshotLog *LogEntry) {
 	args := InstallSnapshotArgs{
 		Term:              rf.CurrentTerm,
+		LeaderID:          rf.me,
 		LastIncludedIndex: snapshotLog.Index,
 		LastIncludedTerm:  snapshotLog.Term,
 		SnapshotData:      rf.persister.ReadSnapshot(),
@@ -130,8 +132,10 @@ func (rf *Raft) handleInstallSnapshot(msg InstallSnapshotMsg) {
 		// 小于当前任期，直接返回
 		return
 	}
-	rf.resetElectionTimeout()
+
 	rf.rpcTermCheck(msg.req.Term)
+	rf.LeaderID = msg.req.LeaderID
+	rf.resetElectionTimeout()
 
 	if msg.req.LastIncludedIndex <= rf.Logs[0].Index {
 		// 旧快照，无需处理

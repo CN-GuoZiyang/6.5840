@@ -6,6 +6,7 @@ func (rf *Raft) rpcTermCheck(msgTerm int) bool {
 		rf.CurrentTerm = msgTerm
 		rf.Status = Follower
 		rf.VotedFor = -1
+		rf.LeaderID = -1
 		DPrintf("node %d become follower for term %d\n", rf.me, rf.CurrentTerm)
 		rf.persist()
 		return false

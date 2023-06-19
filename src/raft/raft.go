@@ -74,8 +74,10 @@ type Raft struct {
 	dead      int32               // set by Kill()
 	applyCh   chan ApplyMsg
 
-	// Status
+	// 身份
 	Status ServerStatus
+	// 当前认定的 Leader ID
+	LeaderID int
 
 	/***** 所有 Server 都包含的持久状态 *****/
 	// CurrentTerm 机器遇到的最大的任期，启动时初始化为 0，单调递增
@@ -356,6 +358,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 
 	rf.Status = Follower
+	rf.LeaderID = -1
 	rf.VotedFor = -1
 	rf.NextIndex = make([]int, len(rf.peers))
 	for index := range rf.NextIndex {

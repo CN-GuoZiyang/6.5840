@@ -127,8 +127,10 @@ func (rf *Raft) handleAppendEntries(msg AppendEntriesMsg) {
 	if rf.CurrentTerm > msg.req.Term {
 		return
 	}
-	rf.resetElectionTimeout()
+
 	rf.rpcTermCheck(msg.req.Term)
+	rf.LeaderID = msg.req.LeaderID
+	rf.resetElectionTimeout()
 
 	prevLog, inSnapshot := rf.getLog(msg.req.PrevLogIndex)
 	if prevLog == nil && !inSnapshot {

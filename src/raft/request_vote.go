@@ -75,6 +75,7 @@ func (rf *Raft) handleRequestVoteRes(msg RequestVoteResMsg) {
 		if meta.yeas > len(rf.peers)/2 {
 			DPrintf("node %d become leader for term %d\n", rf.me, rf.CurrentTerm)
 			rf.Status = Leader
+			rf.LeaderID = rf.me
 			rf.NextIndex = make([]int, len(rf.peers))
 			for i := range rf.NextIndex {
 				rf.NextIndex[i] = rf.getLatestIndex() + 1
