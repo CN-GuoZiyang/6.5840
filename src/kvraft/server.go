@@ -1,12 +1,14 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
 const Debug = false
@@ -18,11 +20,26 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Index      int    // 写入 raft log 时的 index
+	Term       int    // 写入 raft log 时的 term
+	Type       string // PutAppend, Get
+	Key        string
+	Value      string
+	SequenceID int64
+	ClientID   int64
+}
+
+type OpContext struct {
+	origin *Op
+	ok     chan awakeMsg
+}
+
+type awakeMsg struct {
+	wrongLeader bool
+	ignored     bool
+	value       string
+	exist       bool
 }
 
 type KVServer struct {
@@ -34,16 +51,103 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	store       map[string]string  // apply 后的 kv 存储
+	waitMap     map[int]*OpContext // 用于唤醒等待 log id 的上下文
+	sequenceMap map[int64]int64    // 客户端的 sequence ID
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	op := &Op{
+		Type:       "Get",
+		Key:        args.Key,
+		ClientID:   args.ClientID,
+		SequenceID: args.SequenceID,
+	}
+
+	isLeader := false
+	op.Index, op.Term, isLeader = kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	opCtx := &OpContext{
+		origin: op,
+		ok:     make(chan awakeMsg),
+	}
+	func() {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		kv.waitMap[op.Index] = opCtx
+	}()
+	defer func() {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		if item := kv.waitMap[op.Index]; item == opCtx {
+			delete(kv.waitMap, op.Index)
+		}
+	}()
+
+	// 2s 超时
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case msg := <-opCtx.ok:
+		reply.Value = msg.value
+		if msg.wrongLeader {
+			reply.Err = ErrWrongLeader
+		} else if !msg.exist {
+			reply.Err = ErrNoKey
+		}
+	case <-timer.C:
+		reply.Err = ErrWrongLeader
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := &Op{
+		Type:       args.Op,
+		Key:        args.Key,
+		Value:      args.Value,
+		ClientID:   args.ClientID,
+		SequenceID: args.SequenceID,
+	}
+
+	isLeader := false
+	op.Index, op.Term, isLeader = kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	opCtx := &OpContext{
+		origin: op,
+		ok:     make(chan awakeMsg),
+	}
+	func() {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		kv.waitMap[op.Index] = opCtx
+	}()
+	defer func() {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		if item := kv.waitMap[op.Index]; item == opCtx {
+			delete(kv.waitMap, op.Index)
+		}
+	}()
+
+	// 2s 超时
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case msg := <-opCtx.ok:
+		if msg.wrongLeader {
+			reply.Err = ErrWrongLeader
+		}
+	case <-timer.C:
+		reply.Err = ErrWrongLeader
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -92,6 +196,64 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	go kv.applyRoutine()
 
 	return kv
+}
+
+func (kv *KVServer) applyRoutine() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		cmd := msg.Command
+		index := msg.CommandIndex
+		func() {
+			kv.mu.Lock()
+			defer kv.mu.Unlock()
+
+			op := cmd.(*Op)
+			prevSeq, existSeq := kv.sequenceMap[op.ClientID]
+			kv.sequenceMap[op.ClientID] = op.SequenceID
+
+			opCtx, hasWait := kv.waitMap[index]
+			msg := awakeMsg{}
+			defer func() {
+				if !hasWait {
+					return
+				}
+				if opCtx.origin.Term != op.Term {
+					msg.wrongLeader = true
+				}
+				opCtx.ok <- msg
+				close(opCtx.ok)
+			}()
+
+			// Get 操作
+			if op.Type == "Get" {
+				msg.value, msg.exist = kv.store[op.Key]
+				return
+			}
+
+			if existSeq && op.SequenceID <= prevSeq {
+				// seqid 过期
+				msg.ignored = true
+				return
+			}
+
+			// Put 操作
+			if op.Type == "Put" {
+				kv.store[op.Key] = op.Value
+				return
+			}
+
+			// Append 操作
+			if op.Type == "Put" {
+				if val, exist := kv.store[op.Key]; exist {
+					kv.store[op.Key] = val + op.Value
+				} else {
+					kv.store[op.Key] = op.Value
+				}
+				return
+			}
+		}()
+	}
 }
