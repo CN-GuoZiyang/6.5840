@@ -64,14 +64,17 @@ func (ck *Clerk) Get(key string) string {
 		SequenceID: atomic.AddInt64(&ck.sequenceID, 1),
 	}
 
+	DPrintf("client %d get %+v", ck.clientID, args)
 	leaderId := ck.getCurrentLeader()
 	for {
 		reply := GetReply{}
 		if ck.servers[leaderId].Call("KVServer.Get", &args, &reply) {
 			if reply.Err == OK {
+				DPrintf("client %d get %+v res %v", ck.clientID, args, reply.Value)
 				return reply.Value
 			}
 			if reply.Err == ErrNoKey {
+				DPrintf("client %d get %+v res %v", ck.clientID, args, "")
 				return ""
 			}
 		}
@@ -97,6 +100,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		SequenceID: atomic.AddInt64(&ck.sequenceID, 1),
 	}
 
+	DPrintf("client %d put append %+v", ck.clientID, args)
 	leaderId := ck.getCurrentLeader()
 	for {
 		reply := PutAppendReply{}
@@ -106,8 +110,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			}
 		}
 		leaderId = ck.changeLeader()
-		time.Sleep(1 * time.Millisecond)
 	}
+	DPrintf("client %d put append %+v success", ck.clientID, args)
 }
 
 type getCurrentLeaderMsg struct {

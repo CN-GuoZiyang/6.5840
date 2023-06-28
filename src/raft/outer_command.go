@@ -35,6 +35,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) handleOuterCommand(msg outerCommandMsg) {
+	defer rf.broadcastHeartbeat() // lab2 test too many RPCs 请注释掉此行
 	res := outerCommandRes{
 		index:    rf.getLatestIndex() + 1,
 		term:     rf.CurrentTerm,

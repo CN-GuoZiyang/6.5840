@@ -48,6 +48,7 @@ func (rf *Raft) getApplyMsgs(msg applyMsgsReq) {
 				CommandValid: true,
 				Command:      l.Command,
 				CommandIndex: l.Index,
+				CommandTerm:  l.Term,
 			})
 		}
 	}

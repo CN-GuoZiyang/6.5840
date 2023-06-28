@@ -21,8 +21,6 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type Op struct {
-	Index      int    // 写入 raft log 时的 index
-	Term       int    // 写入 raft log 时的 term
 	Type       string // PutAppend, Get
 	Key        string
 	Value      string
@@ -31,7 +29,9 @@ type Op struct {
 }
 
 type OpContext struct {
-	origin *Op
+	origin Op
+	index  int
+	term   int
 	ok     chan awakeMsg
 }
 
@@ -57,34 +57,37 @@ type KVServer struct {
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	op := &Op{
+	reply.Err = OK
+	op := Op{
 		Type:       "Get",
 		Key:        args.Key,
 		ClientID:   args.ClientID,
 		SequenceID: args.SequenceID,
 	}
 
-	isLeader := false
-	op.Index, op.Term, isLeader = kv.rf.Start(op)
+	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	DPrintf("server %d get start %+v", kv.me, op)
 
 	opCtx := &OpContext{
 		origin: op,
+		index:  index,
+		term:   term,
 		ok:     make(chan awakeMsg),
 	}
 	func() {
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
-		kv.waitMap[op.Index] = opCtx
+		kv.waitMap[index] = opCtx
 	}()
 	defer func() {
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
-		if item := kv.waitMap[op.Index]; item == opCtx {
-			delete(kv.waitMap, op.Index)
+		if item := kv.waitMap[index]; item == opCtx {
+			delete(kv.waitMap, index)
 		}
 	}()
 
@@ -93,6 +96,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	defer timer.Stop()
 	select {
 	case msg := <-opCtx.ok:
+		DPrintf("server %d get res %+v", kv.me, msg)
 		reply.Value = msg.value
 		if msg.wrongLeader {
 			reply.Err = ErrWrongLeader
@@ -105,7 +109,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	op := &Op{
+	reply.Err = OK
+	op := Op{
 		Type:       args.Op,
 		Key:        args.Key,
 		Value:      args.Value,
@@ -113,27 +118,30 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		SequenceID: args.SequenceID,
 	}
 
-	isLeader := false
-	op.Index, op.Term, isLeader = kv.rf.Start(op)
+	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
+		// DPrintf("server %d not leader", kv.me)
 		reply.Err = ErrWrongLeader
 		return
 	}
+	DPrintf("server %d put append start %+v", kv.me, op)
 
 	opCtx := &OpContext{
 		origin: op,
+		index:  index,
+		term:   term,
 		ok:     make(chan awakeMsg),
 	}
 	func() {
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
-		kv.waitMap[op.Index] = opCtx
+		kv.waitMap[index] = opCtx
 	}()
 	defer func() {
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
-		if item := kv.waitMap[op.Index]; item == opCtx {
-			delete(kv.waitMap, op.Index)
+		if item := kv.waitMap[index]; item == opCtx {
+			delete(kv.waitMap, index)
 		}
 	}()
 
@@ -147,6 +155,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 	case <-timer.C:
 		reply.Err = ErrWrongLeader
+		DPrintf("server %d timeout", kv.me)
 	}
 }
 
@@ -195,6 +204,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.store = map[string]string{}
+	kv.sequenceMap = map[int64]int64{}
+	kv.waitMap = map[int]*OpContext{}
+
 	// You may need initialization code here.
 	go kv.applyRoutine()
 
@@ -206,11 +219,12 @@ func (kv *KVServer) applyRoutine() {
 		msg := <-kv.applyCh
 		cmd := msg.Command
 		index := msg.CommandIndex
+		msgTerm := msg.CommandTerm
 		func() {
 			kv.mu.Lock()
 			defer kv.mu.Unlock()
 
-			op := cmd.(*Op)
+			op := cmd.(Op)
 			prevSeq, existSeq := kv.sequenceMap[op.ClientID]
 			kv.sequenceMap[op.ClientID] = op.SequenceID
 
@@ -220,9 +234,10 @@ func (kv *KVServer) applyRoutine() {
 				if !hasWait {
 					return
 				}
-				if opCtx.origin.Term != op.Term {
+				if opCtx.term != msgTerm {
 					msg.wrongLeader = true
 				}
+				DPrintf("server %d apply res %+v", kv.me, msg)
 				opCtx.ok <- msg
 				close(opCtx.ok)
 			}()
@@ -239,6 +254,8 @@ func (kv *KVServer) applyRoutine() {
 				return
 			}
 
+			DPrintf("server %d apply %+v", kv.me, op)
+
 			// Put 操作
 			if op.Type == "Put" {
 				kv.store[op.Key] = op.Value
@@ -246,7 +263,7 @@ func (kv *KVServer) applyRoutine() {
 			}
 
 			// Append 操作
-			if op.Type == "Put" {
+			if op.Type == "Append" {
 				if val, exist := kv.store[op.Key]; exist {
 					kv.store[op.Key] = val + op.Value
 				} else {
