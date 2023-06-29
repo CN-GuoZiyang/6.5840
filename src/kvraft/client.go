@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"math/big"
 	"sync/atomic"
-	"time"
 
 	"6.5840/labrpc"
 )
@@ -79,7 +78,6 @@ func (ck *Clerk) Get(key string) string {
 			}
 		}
 		leaderId = ck.changeLeader()
-		time.Sleep(1 * time.Millisecond)
 	}
 }
 

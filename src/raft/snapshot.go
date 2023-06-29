@@ -47,6 +47,25 @@ func (rf *Raft) handleOuterSnapshot(msg outerSnapshotMsg) {
 	DPrintf("Node %d snapshot from index %d", rf.me, msg.index)
 }
 
+type ExceedSnapshotSizeMsg struct {
+	size int
+	ok   chan bool
+}
+
+// kv 层调用，判断是否超出需要快照的长度
+func (rf *Raft) ExceedSnapshotSize(size int) bool {
+	msg := ExceedSnapshotSizeMsg{
+		size: size,
+		ok:   make(chan bool),
+	}
+	rf.exceedSnapshotSizeChan <- msg
+	return <-msg.ok
+}
+
+func (rf *Raft) handleExceedSnapshotSize(msg ExceedSnapshotSizeMsg) {
+	msg.ok <- (rf.persister.RaftStateSize() >= msg.size)
+}
+
 // Server 发送给 Follower 的同步日志的 RPC
 type InstallSnapshotArgs struct {
 	Term              int

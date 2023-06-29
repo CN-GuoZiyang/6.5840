@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -50,10 +51,12 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
-	store       map[string]string  // apply 后的 kv 存储
-	waitMap     map[int]*OpContext // 用于唤醒等待 log id 的上下文
-	sequenceMap map[int64]int64    // 客户端的 sequence ID
+	store            map[string]string  // apply 后的 kv 存储
+	waitMap          map[int]*OpContext // 用于唤醒等待 log id 的上下文
+	sequenceMap      map[int64]int64    // 客户端的 sequence ID
+	lastAppliedIndex int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -208,8 +211,20 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.sequenceMap = map[int64]int64{}
 	kv.waitMap = map[int]*OpContext{}
 
+	kv.persister = persister
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) != 0 {
+		r := bytes.NewBuffer(snapshot)
+		d := labgob.NewDecoder(r)
+		d.Decode(&kv.store)
+		d.Decode(&kv.sequenceMap)
+	}
+
 	// You may need initialization code here.
 	go kv.applyRoutine()
+	if maxraftstate != -1 {
+		go kv.snapshotRoutine()
+	}
 
 	return kv
 }
@@ -217,60 +232,97 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 func (kv *KVServer) applyRoutine() {
 	for !kv.killed() {
 		msg := <-kv.applyCh
-		cmd := msg.Command
-		index := msg.CommandIndex
-		msgTerm := msg.CommandTerm
-		func() {
-			kv.mu.Lock()
-			defer kv.mu.Unlock()
+		if msg.CommandValid {
+			// 提交命令
+			cmd := msg.Command
+			index := msg.CommandIndex
+			msgTerm := msg.CommandTerm
+			func() {
+				kv.mu.Lock()
+				defer kv.mu.Unlock()
 
-			op := cmd.(Op)
-			prevSeq, existSeq := kv.sequenceMap[op.ClientID]
-			kv.sequenceMap[op.ClientID] = op.SequenceID
+				kv.lastAppliedIndex = index
+				op := cmd.(Op)
+				prevSeq, existSeq := kv.sequenceMap[op.ClientID]
+				kv.sequenceMap[op.ClientID] = op.SequenceID
 
-			opCtx, hasWait := kv.waitMap[index]
-			msg := awakeMsg{}
-			defer func() {
-				if !hasWait {
+				opCtx, hasWait := kv.waitMap[index]
+				msg := awakeMsg{}
+				defer func() {
+					if !hasWait {
+						return
+					}
+					if opCtx.term != msgTerm {
+						msg.wrongLeader = true
+					}
+					DPrintf("server %d apply res %+v", kv.me, msg)
+					opCtx.ok <- msg
+					close(opCtx.ok)
+				}()
+
+				// Get 操作
+				if op.Type == "Get" {
+					msg.value, msg.exist = kv.store[op.Key]
 					return
 				}
-				if opCtx.term != msgTerm {
-					msg.wrongLeader = true
+
+				if existSeq && op.SequenceID <= prevSeq {
+					// seqid 过期
+					msg.ignored = true
+					return
 				}
-				DPrintf("server %d apply res %+v", kv.me, msg)
-				opCtx.ok <- msg
-				close(opCtx.ok)
-			}()
 
-			// Get 操作
-			if op.Type == "Get" {
-				msg.value, msg.exist = kv.store[op.Key]
-				return
-			}
+				DPrintf("server %d apply %+v", kv.me, op)
 
-			if existSeq && op.SequenceID <= prevSeq {
-				// seqid 过期
-				msg.ignored = true
-				return
-			}
-
-			DPrintf("server %d apply %+v", kv.me, op)
-
-			// Put 操作
-			if op.Type == "Put" {
-				kv.store[op.Key] = op.Value
-				return
-			}
-
-			// Append 操作
-			if op.Type == "Append" {
-				if val, exist := kv.store[op.Key]; exist {
-					kv.store[op.Key] = val + op.Value
-				} else {
+				// Put 操作
+				if op.Type == "Put" {
 					kv.store[op.Key] = op.Value
+					return
 				}
-				return
-			}
-		}()
+
+				// Append 操作
+				if op.Type == "Append" {
+					if val, exist := kv.store[op.Key]; exist {
+						kv.store[op.Key] = val + op.Value
+					} else {
+						kv.store[op.Key] = op.Value
+					}
+					return
+				}
+			}()
+		}
+		if msg.SnapshotValid {
+			// 安装快照
+			func() {
+				kv.mu.Lock()
+				defer kv.mu.Unlock()
+				if msg.SnapshotIndex <= kv.lastAppliedIndex {
+					// 旧快照，忽略
+					return
+				}
+				kv.lastAppliedIndex = msg.SnapshotIndex
+				r := bytes.NewBuffer(msg.Snapshot)
+				d := labgob.NewDecoder(r)
+				d.Decode(&kv.store)
+				d.Decode(&kv.sequenceMap)
+			}()
+		}
+	}
+}
+
+func (kv *KVServer) snapshotRoutine() {
+	for !kv.killed() {
+		if kv.rf.ExceedSnapshotSize(kv.maxraftstate) {
+			kv.mu.Lock()
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(kv.store)
+			e.Encode(kv.sequenceMap)
+			snapshot := w.Bytes()
+			lastIncludedIndex := kv.lastAppliedIndex
+			kv.mu.Unlock()
+			kv.rf.Snapshot(lastIncludedIndex, snapshot)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

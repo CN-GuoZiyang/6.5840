@@ -128,6 +128,8 @@ type Raft struct {
 	outerSnapshotChan chan outerSnapshotMsg
 	// 外部获取服务状态的管道
 	getStateChan chan getStateMsg
+	// 外部获取是否超出需要快照的管道
+	exceedSnapshotSizeChan chan ExceedSnapshotSizeMsg
 }
 
 // return currentTerm and whether this server
@@ -219,6 +221,8 @@ func (rf *Raft) mainRoutine() {
 				term:     rf.CurrentTerm,
 				isLeader: rf.Status == Leader,
 			}
+		case msg := <-rf.exceedSnapshotSizeChan:
+			rf.handleExceedSnapshotSize(msg)
 		}
 	}
 }
@@ -383,6 +387,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.outerCommandChan = make(chan outerCommandMsg)
 	rf.outerSnapshotChan = make(chan outerSnapshotMsg)
 	rf.getStateChan = make(chan getStateMsg)
+	rf.exceedSnapshotSizeChan = make(chan ExceedSnapshotSizeMsg)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
