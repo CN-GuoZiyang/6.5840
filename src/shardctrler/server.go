@@ -27,6 +27,7 @@ type ShardCtrler struct {
 type awakeMsg struct {
 	wrongLeader bool
 	ignored     bool
+	config      Config
 }
 
 const (
@@ -42,6 +43,9 @@ type Op struct {
 	ClientID    int64
 	JoinServers map[int][]string
 	LeaveGids   []int
+	MoveShard   int
+	MoveGid     int
+	QueryNum    int
 }
 
 type OpContext struct {
@@ -146,11 +150,99 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
-	// Your code here.
+	reply.Err = OK
+	op := Op{
+		Type:       OpType_Move,
+		ClientID:   args.ClientID,
+		SequenceID: args.SequenceID,
+		MoveShard:  args.Shard,
+		MoveGid:    args.GID,
+	}
+	index, term, isLeader := sc.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("server %d move start %+v", sc.me, op)
+
+	opCtx := &OpContext{
+		origin: op,
+		index:  index,
+		term:   term,
+		ok:     make(chan awakeMsg),
+	}
+	func() {
+		sc.mu.Lock()
+		defer sc.mu.Unlock()
+		sc.waitMap[index] = opCtx
+	}()
+	defer func() {
+		sc.mu.Lock()
+		defer sc.mu.Unlock()
+		if item := sc.waitMap[index]; item == opCtx {
+			delete(sc.waitMap, index)
+		}
+	}()
+
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case msg := <-opCtx.ok:
+		DPrintf("server %d move res %+v", sc.me, msg)
+		if msg.wrongLeader {
+			reply.Err = ErrWrongLeader
+		}
+	case <-timer.C:
+		reply.Err = ErrWrongLeader
+	}
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
-	// Your code here.
+	reply.Err = OK
+	op := Op{
+		Type:       OpType_Query,
+		ClientID:   args.ClientID,
+		SequenceID: args.SequenceID,
+		QueryNum:   args.Num,
+	}
+	index, term, isLeader := sc.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("server %d query start %+v", sc.me, op)
+
+	opCtx := &OpContext{
+		origin: op,
+		index:  index,
+		term:   term,
+		ok:     make(chan awakeMsg),
+	}
+	func() {
+		sc.mu.Lock()
+		defer sc.mu.Unlock()
+		sc.waitMap[index] = opCtx
+	}()
+	defer func() {
+		sc.mu.Lock()
+		defer sc.mu.Unlock()
+		if item := sc.waitMap[index]; item == opCtx {
+			delete(sc.waitMap, index)
+		}
+	}()
+
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case msg := <-opCtx.ok:
+		DPrintf("server %d query res %+v", sc.me, msg)
+		reply.Config = msg.config
+		if msg.wrongLeader {
+			reply.Err = ErrWrongLeader
+		}
+	case <-timer.C:
+		reply.Err = ErrWrongLeader
+	}
 }
 
 // the tester calls Kill() when a ShardCtrler instance won't
@@ -225,6 +317,16 @@ func (sc *ShardCtrler) applyRoutine() {
 					close(opCtx.ok)
 				}()
 
+				// Query 操作
+				if op.Type == OpType_Query {
+					if op.QueryNum == -1 || op.QueryNum >= len(sc.configs) {
+						msg.config = sc.configs[len(sc.configs)-1]
+					} else {
+						msg.config = sc.configs[op.QueryNum]
+					}
+					return
+				}
+
 				if existSeq && op.SequenceID <= prevSeq {
 					// seqid 过期
 					msg.ignored = true
@@ -242,6 +344,12 @@ func (sc *ShardCtrler) applyRoutine() {
 				// Leave 操作
 				if op.Type == OpType_Leave {
 					sc.configs = append(sc.configs, *sc.MakeLeaveConfig(op.LeaveGids))
+					return
+				}
+
+				// Move 操作
+				if op.Type == OpType_Move {
+					sc.configs = append(sc.configs, *sc.MakeMoveConfig(op.MoveShard, op.MoveGid))
 					return
 				}
 			}()
@@ -268,7 +376,9 @@ func (sc *ShardCtrler) MakeJoinConfig(servers map[int][]string) *Config {
 
 	gid2Shards := map[int][]int{}
 	for shard, gid := range newestConfig.Shards {
-		gid2Shards[gid] = append(gid2Shards[gid], shard)
+		if gid != 0 {
+			gid2Shards[gid] = append(gid2Shards[gid], shard)
+		}
 	}
 
 	return &Config{
@@ -307,8 +417,21 @@ func (sc *ShardCtrler) MakeLeaveConfig(leaveGids []int) *Config {
 	}
 }
 
+func (sc *ShardCtrler) MakeMoveConfig(shard, gid int) *Config {
+	newestConfig := sc.configs[len(sc.configs)-1]
+	newShardsArr := newestConfig.Shards
+	newShardsArr[shard] = gid
+	return &Config{
+		Num:    len(sc.configs),
+		Shards: newShardsArr,
+		Groups: newestConfig.Groups,
+	}
+}
+
 // 传入 gid 保证遍历顺序稳定
 func (sc *ShardCtrler) rebalanceShards(gids []int, gid2Shards map[int][]int) [NShards]int {
+	DPrintf("server %d reblance: gid: %+v, gid2Shards: %+v", sc.me, gids, gid2Shards)
+
 	var res [NShards]int
 	if len(gids) == 0 {
 		return res
@@ -321,7 +444,19 @@ func (sc *ShardCtrler) rebalanceShards(gids []int, gid2Shards map[int][]int) [NS
 		gidMap[gid] = struct{}{}
 	}
 
+	// 尚未分配的 shard
 	var extraShard []int
+	shardExist := map[int]struct{}{}
+	for _, shards := range gid2Shards {
+		for _, shard := range shards {
+			shardExist[shard] = struct{}{}
+		}
+	}
+	for shard := range res {
+		if _, exist := shardExist[shard]; !exist {
+			extraShard = append(extraShard, shard)
+		}
+	}
 	// 超出平均的退
 	for _, gid := range sortMapIndex(gid2Shards) {
 		shards := gid2Shards[gid]
