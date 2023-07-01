@@ -4,8 +4,13 @@ import (
 	"crypto/rand"
 	"math/big"
 	"sync/atomic"
+	"time"
 
 	"6.5840/labrpc"
+)
+
+const (
+	RequestInterval = 10 // ms
 )
 
 type Clerk struct {
@@ -78,6 +83,7 @@ func (ck *Clerk) Get(key string) string {
 			}
 		}
 		leaderId = ck.changeLeader()
+		time.Sleep(RequestInterval * time.Millisecond)
 	}
 }
 
@@ -108,6 +114,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			}
 		}
 		leaderId = ck.changeLeader()
+		time.Sleep(RequestInterval * time.Millisecond)
 	}
 	DPrintf("client %d put append %+v success", ck.clientID, args)
 }

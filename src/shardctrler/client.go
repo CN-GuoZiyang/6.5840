@@ -4,14 +4,27 @@ package shardctrler
 // Shardctrler clerk.
 //
 
-import "6.5840/labrpc"
-import "time"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync/atomic"
+	"time"
+
+	"6.5840/labrpc"
+)
+
+const (
+	RequestInterval = 10 // ms
+)
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// Your data here.
+	servers    []*labrpc.ClientEnd
+	clientID   int64 // 客户端唯一标识
+	sequenceID int64 // 客户端递增的请求 ID
+	leaderID   int   // 缓存该客户端认识的 leader ID
+
+	getCurrentLeaderChan chan getCurrentLeaderMsg
+	changeLeaderChan     chan changeLeaderMsg
 }
 
 func nrand() int64 {
@@ -24,78 +37,144 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// Your code here.
+	ck.clientID = nrand()
+	ck.getCurrentLeaderChan = make(chan getCurrentLeaderMsg)
+	ck.changeLeaderChan = make(chan changeLeaderMsg)
+	go ck.leaderRoutine()
 	return ck
 }
 
-func (ck *Clerk) Query(num int) Config {
-	args := &QueryArgs{}
-	// Your code here.
-	args.Num = num
+func (ck *Clerk) leaderRoutine() {
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply QueryReply
-			ok := srv.Call("ShardCtrler.Query", args, &reply)
-			if ok && reply.WrongLeader == false {
+		select {
+		case msg := <-ck.getCurrentLeaderChan:
+			ck.handleGetCurrentLeader(msg)
+		case msg := <-ck.changeLeaderChan:
+			ck.handleChangeLeader(msg)
+		}
+	}
+}
+
+func (ck *Clerk) Query(num int) Config {
+	args := QueryArgs{
+		Num:        num,
+		ClientID:   ck.clientID,
+		SequenceID: atomic.AddInt64(&ck.sequenceID, 1),
+	}
+
+	DPrintf("client %d query %+v", ck.clientID, args)
+	leaderId := ck.getCurrentLeader()
+	for {
+		reply := QueryReply{}
+		if ck.servers[leaderId].Call("ShardCtrler.Query", &args, &reply) {
+			if reply.Err == OK {
+				DPrintf("client %d query %+v success res %+v", ck.clientID, args, reply.Config)
 				return reply.Config
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		leaderId = ck.changeLeader()
+		time.Sleep(RequestInterval * time.Millisecond)
 	}
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
-	// Your code here.
-	args.Servers = servers
+	args := JoinArgs{
+		Servers:    servers,
+		ClientID:   ck.clientID,
+		SequenceID: atomic.AddInt64(&ck.sequenceID, 1),
+	}
 
+	DPrintf("client %d join %+v", ck.clientID, args)
+	leaderId := ck.getCurrentLeader()
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply JoinReply
-			ok := srv.Call("ShardCtrler.Join", args, &reply)
-			if ok && reply.WrongLeader == false {
+		reply := JoinReply{}
+		if ck.servers[leaderId].Call("ShardCtrler.Join", &args, &reply) {
+			if reply.Err == OK {
+				DPrintf("client %d join %+v success", ck.clientID, args)
 				return
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		leaderId = ck.changeLeader()
+		time.Sleep(RequestInterval * time.Millisecond)
 	}
 }
 
 func (ck *Clerk) Leave(gids []int) {
-	args := &LeaveArgs{}
-	// Your code here.
-	args.GIDs = gids
+	args := LeaveArgs{
+		GIDs:       gids,
+		ClientID:   ck.clientID,
+		SequenceID: atomic.AddInt64(&ck.sequenceID, 1),
+	}
 
+	DPrintf("client %d leave %+v", ck.clientID, args)
+	leaderId := ck.getCurrentLeader()
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply LeaveReply
-			ok := srv.Call("ShardCtrler.Leave", args, &reply)
-			if ok && reply.WrongLeader == false {
+		reply := LeaveReply{}
+		if ck.servers[leaderId].Call("ShardCtrler.Leave", &args, &reply) {
+			if reply.Err == OK {
+				DPrintf("client %d leave %+v success", ck.clientID, args)
 				return
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		leaderId = ck.changeLeader()
+		time.Sleep(RequestInterval * time.Millisecond)
 	}
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &MoveArgs{}
-	// Your code here.
-	args.Shard = shard
-	args.GID = gid
+	args := MoveArgs{
+		Shard:      shard,
+		GID:        gid,
+		ClientID:   ck.clientID,
+		SequenceID: atomic.AddInt64(&ck.sequenceID, 1),
+	}
 
+	DPrintf("client %d move %+v", ck.clientID, args)
+	leaderId := ck.getCurrentLeader()
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply MoveReply
-			ok := srv.Call("ShardCtrler.Move", args, &reply)
-			if ok && reply.WrongLeader == false {
+		reply := MoveReply{}
+		if ck.servers[leaderId].Call("ShardCtrler.Move", &args, &reply) {
+			if reply.Err == OK {
+				DPrintf("client %d move %+v success", ck.clientID, args)
 				return
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		leaderId = ck.changeLeader()
+		time.Sleep(RequestInterval * time.Millisecond)
 	}
+}
+
+type getCurrentLeaderMsg struct {
+	ok chan int
+}
+
+func (ck *Clerk) getCurrentLeader() int {
+	msg := getCurrentLeaderMsg{
+		ok: make(chan int),
+	}
+	ck.getCurrentLeaderChan <- msg
+	res := <-msg.ok
+	return res
+}
+
+func (ck *Clerk) handleGetCurrentLeader(msg getCurrentLeaderMsg) {
+	msg.ok <- ck.leaderID
+}
+
+type changeLeaderMsg struct {
+	ok chan int
+}
+
+func (ck *Clerk) changeLeader() int {
+	msg := changeLeaderMsg{
+		ok: make(chan int),
+	}
+	ck.changeLeaderChan <- msg
+	res := <-msg.ok
+	return res
+}
+
+func (ck *Clerk) handleChangeLeader(msg changeLeaderMsg) {
+	ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
+	msg.ok <- ck.leaderID
 }
