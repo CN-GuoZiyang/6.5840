@@ -12,12 +12,18 @@ import (
 	"6.5840/shardctrler"
 )
 
+type OpType int
+
+const (
+	OpTypeCommand = iota
+	OpTypePullShard
+	OpTypeInsertShard
+	OpTypeDeleteShard
+)
+
 type Op struct {
-	Type       string // PutAppend, Get
-	Key        string
-	Value      string
-	SequenceID int64
-	ClientID   int64
+	Type OpType
+	Data interface{}
 }
 
 type OpContext struct {
@@ -25,6 +31,29 @@ type OpContext struct {
 	index  int
 	term   int
 	ok     chan awakeMsg
+}
+
+type CommandRequest struct {
+	Type       string
+	Key        string
+	Value      string
+	SequenceID int64
+	ClientID   int64
+}
+
+type ShardStatus int
+
+const (
+	Servable     = iota // 不归该 Server 管理，或可提供服务
+	Pulling             // 该分片当前配置由该 Server 管理，但还未从上个配置中拉取，不可提供服务
+	WaitDeleting        // 该分片当前配置由该 Server 管理且可提供服务，但上个配置管理该分片的 Server 尚未删除（Pushing），可提供服务
+	Pushing             // 该分片当前配置不由该 Server 管理，但上个配置由该 Server 管理，不可提供服务
+)
+
+// 存储 Server 管理一个 Shard 的内容
+type Shard struct {
+	ShardStatus ShardStatus
+	Store       map[string]string // Shard 实际存储
 }
 
 type awakeMsg struct {
@@ -47,24 +76,27 @@ type ShardKV struct {
 	dead         int32
 	persister    *raft.Persister
 
-	config shardctrler.Config
-	mck    *shardctrler.Clerk
+	mck *shardctrler.Clerk
 
-	store            map[string]string  // apply 后的 kv 存储
+	currentCfg shardctrler.Config
+	futureCfg  shardctrler.Config // 迁移中时等待生效的配置
+
+	shardMap         map[int]*Shard
 	waitMap          map[int]*OpContext // 用于唤醒等待 log id 的上下文
 	sequenceMap      map[int64]int64    // 客户端的 sequence ID
 	lastAppliedIndex int
-
-	availableShards map[int]struct{}
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	reply.Err = OK
 	op := Op{
-		Type:       "Get",
-		Key:        args.Key,
-		ClientID:   args.ClientID,
-		SequenceID: args.SequenceID,
+		Type: OpTypeCommand,
+		Data: CommandRequest{
+			Type:       "Get",
+			Key:        args.Key,
+			ClientID:   args.ClientID,
+			SequenceID: args.SequenceID,
+		},
 	}
 
 	index, term, isLeader := kv.rf.Start(op)
@@ -116,11 +148,14 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.Err = OK
 	op := Op{
-		Type:       args.Op,
-		Key:        args.Key,
-		Value:      args.Value,
-		ClientID:   args.ClientID,
-		SequenceID: args.SequenceID,
+		Type: OpTypeCommand,
+		Data: CommandRequest{
+			Type:       args.Op,
+			Key:        args.Key,
+			Value:      args.Value,
+			ClientID:   args.ClientID,
+			SequenceID: args.SequenceID,
+		},
 	}
 
 	index, term, isLeader := kv.rf.Start(op)
@@ -182,6 +217,22 @@ func (kv *ShardKV) killed() bool {
 	return z == 1
 }
 
+func defaultConfig(gid int) shardctrler.Config {
+	return shardctrler.Config{
+		Num:    0,
+		Shards: [shardctrler.NShards]int{gid, gid, gid, gid, gid, gid, gid, gid, gid, gid},
+		Groups: map[int][]string{},
+	}
+}
+
+func defaultShardMap() map[int]*Shard {
+	res := map[int]*Shard{}
+	for i := 0; i < shardctrler.NShards; i++ {
+		res[i] = &Shard{ShardStatus: Servable, Store: map[string]string{}}
+	}
+	return res
+}
+
 // servers[] contains the ports of the servers in this group.
 //
 // me is the index of the current server in servers[].
@@ -212,65 +263,56 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(CommandRequest{})
 
-	kv := new(ShardKV)
-	kv.me = me
-	kv.maxraftstate = maxraftstate
-	kv.make_end = make_end
-	kv.gid = gid
-	kv.ctrlers = ctrlers
+	applyCh := make(chan raft.ApplyMsg)
+	kv := &ShardKV{
+		me:               me,
+		rf:               raft.Make(servers, me, persister, applyCh),
+		applyCh:          applyCh,
+		make_end:         make_end,
+		gid:              gid,
+		ctrlers:          ctrlers,
+		maxraftstate:     maxraftstate,
+		dead:             0,
+		persister:        persister,
+		mck:              shardctrler.MakeClerk(ctrlers),
+		currentCfg:       defaultConfig(gid),
+		futureCfg:        defaultConfig(gid),
+		shardMap:         defaultShardMap(),
+		waitMap:          map[int]*OpContext{}, // 用于唤醒等待 log id 的上下文
+		sequenceMap:      map[int64]int64{},    // 客户端的 sequence ID
+		lastAppliedIndex: 0,
+	}
 
-	// Your initialization code here.
-
-	// Use something like this to talk to the shardctrler:
-	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
-
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	kv.store = map[string]string{}
-	kv.sequenceMap = map[int64]int64{}
-	kv.waitMap = map[int]*OpContext{}
-
-	kv.availableShards = map[int]struct{}{}
-
-	kv.persister = persister
 	snapshot := persister.ReadSnapshot()
 	if len(snapshot) != 0 {
 		r := bytes.NewBuffer(snapshot)
 		d := labgob.NewDecoder(r)
-		d.Decode(&kv.store)
+		d.Decode(&kv.shardMap)
 		d.Decode(&kv.sequenceMap)
+		d.Decode(&kv.currentCfg)
+		d.Decode(&kv.futureCfg)
 	}
 
-	go kv.pullLatestCfg()
 	go kv.applyRoutine()
 	if maxraftstate != -1 {
 		go kv.snapshotRoutine()
 	}
+	go kv.pullLatestCfg()
+	go kv.pullShard()
+	go kv.deleteShard()
 
 	return kv
 }
 
 func (kv *ShardKV) pullLatestCfg() {
-	for !kv.killed() {
-		_, isLeader := kv.rf.GetState()
-		func() {
-			kv.mu.Lock()
-			if !isLeader {
-				kv.mu.Unlock()
-				return
-			}
-			nextNum := kv.config.Num + 1
-			kv.mu.Unlock()
-			cfg := kv.mck.Query(nextNum)
-			// 获取到了下一份配置
-			if cfg.Num == nextNum {
-				_, _, _ = kv.rf.Start(cfg)
-			}
-		}()
-		time.Sleep(50 * time.Millisecond)
-	}
+}
+
+func (kv *ShardKV) pullShard() {
+}
+
+func (kv *ShardKV) deleteShard() {
 }
 
 func (kv *ShardKV) applyRoutine() {
@@ -278,68 +320,34 @@ func (kv *ShardKV) applyRoutine() {
 		msg := <-kv.applyCh
 		if msg.CommandValid {
 			// 提交命令
-			cmd := msg.Command
-			op := cmd.(Op)
 			index := msg.CommandIndex
 			msgTerm := msg.CommandTerm
 
 			func() {
 				kv.mu.Lock()
 				defer kv.mu.Unlock()
-
+				if index <= kv.lastAppliedIndex {
+					return
+				}
 				kv.lastAppliedIndex = index
-				prevSeq, existSeq := kv.sequenceMap[op.ClientID]
-				kv.sequenceMap[op.ClientID] = op.SequenceID
+
+				var aMsg *awakeMsg
+				op := msg.Command.(Op)
+				switch op.Type {
+				case OpTypeCommand:
+					aMsg = kv.applyCommand(op)
+				}
 
 				opCtx, hasWait := kv.waitMap[index]
-				aMsg := awakeMsg{}
-				defer func() {
-					if !hasWait {
-						return
-					}
-					if opCtx.term != msgTerm {
-						aMsg.wrongLeader = true
-					}
-					DPrintf("server %d apply res %+v", kv.me, aMsg)
-					opCtx.ok <- aMsg
-					close(opCtx.ok)
-				}()
-
-				shard := key2shard(op.Key)
-				if _, ok := kv.availableShards[shard]; !ok {
-					aMsg.wrongGroup = true
+				if !hasWait {
 					return
 				}
-
-				// Get 操作
-				if op.Type == "Get" {
-					aMsg.value, aMsg.exist = kv.store[op.Key]
-					return
+				if opCtx.term != msgTerm {
+					aMsg.wrongLeader = true
 				}
-
-				if existSeq && op.SequenceID <= prevSeq {
-					// seqid 过期
-					aMsg.ignored = true
-					return
-				}
-
-				DPrintf("server %d apply %+v", kv.me, op)
-
-				// Put 操作
-				if op.Type == "Put" {
-					kv.store[op.Key] = op.Value
-					return
-				}
-
-				// Append 操作
-				if op.Type == "Append" {
-					if val, exist := kv.store[op.Key]; exist {
-						kv.store[op.Key] = val + op.Value
-					} else {
-						kv.store[op.Key] = op.Value
-					}
-					return
-				}
+				DPrintf("server %d apply res %+v", kv.me, aMsg)
+				opCtx.ok <- *aMsg
+				close(opCtx.ok)
 			}()
 		}
 		if msg.SnapshotValid {
@@ -354,11 +362,62 @@ func (kv *ShardKV) applyRoutine() {
 				kv.lastAppliedIndex = msg.SnapshotIndex
 				r := bytes.NewBuffer(msg.Snapshot)
 				d := labgob.NewDecoder(r)
-				d.Decode(&kv.store)
+				d.Decode(&kv.shardMap)
 				d.Decode(&kv.sequenceMap)
+				d.Decode(&kv.currentCfg)
+				d.Decode(&kv.futureCfg)
 			}()
 		}
 	}
+}
+
+func (kv *ShardKV) canServe(shard int) bool {
+	return kv.currentCfg.Shards[shard] == kv.gid &&
+		(kv.shardMap[shard].ShardStatus == Servable || kv.shardMap[shard].ShardStatus == WaitDeleting)
+}
+
+func (kv *ShardKV) applyCommand(rawOp Op) *awakeMsg {
+	op := rawOp.Data.(CommandRequest)
+	shard := key2shard(op.Key)
+	if !kv.canServe(shard) {
+		return &awakeMsg{wrongGroup: true}
+	}
+
+	aMsg := &awakeMsg{}
+	prevSeq, existSeq := kv.sequenceMap[op.ClientID]
+	kv.sequenceMap[op.ClientID] = op.SequenceID
+
+	// Get 操作
+	if op.Type == "Get" {
+		aMsg.value, aMsg.exist = kv.shardMap[shard].Store[op.Key]
+		return aMsg
+	}
+
+	if existSeq && op.SequenceID <= prevSeq {
+		// seqid 过期
+		aMsg.ignored = true
+		return aMsg
+	}
+
+	DPrintf("server %d apply %+v", kv.me, op)
+
+	// Put 操作
+	if op.Type == "Put" {
+		kv.shardMap[shard].Store[op.Key] = op.Value
+		return aMsg
+	}
+
+	// Append 操作
+	if op.Type == "Append" {
+		if val, exist := kv.shardMap[shard].Store[op.Key]; exist {
+			kv.shardMap[shard].Store[op.Key] = val + op.Value
+		} else {
+			kv.shardMap[shard].Store[op.Key] = op.Value
+		}
+		return aMsg
+	}
+
+	return aMsg
 }
 
 func (kv *ShardKV) snapshotRoutine() {
@@ -367,8 +426,10 @@ func (kv *ShardKV) snapshotRoutine() {
 			kv.mu.Lock()
 			w := new(bytes.Buffer)
 			e := labgob.NewEncoder(w)
-			e.Encode(kv.store)
+			e.Encode(kv.shardMap)
 			e.Encode(kv.sequenceMap)
+			e.Encode(kv.currentCfg)
+			e.Encode(kv.futureCfg)
 			snapshot := w.Bytes()
 			lastIncludedIndex := kv.lastAppliedIndex
 			kv.mu.Unlock()
