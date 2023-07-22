@@ -269,6 +269,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 	labgob.Register(CommandRequest{})
+	labgob.Register(&shardctrler.Config{})
 
 	applyCh := make(chan raft.ApplyMsg)
 	kv := &ShardKV{
@@ -338,7 +339,7 @@ func (kv *ShardKV) pullLatestCfg() {
 
 			_, _, _ = kv.rf.Start(op)
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
