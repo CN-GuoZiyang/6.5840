@@ -16,7 +16,7 @@ type OpType int
 
 const (
 	OpTypeCommand = iota
-	OpTypePullShard
+	OpTypeConfig
 	OpTypeInsertShard
 	OpTypeDeleteShard
 )
@@ -44,10 +44,11 @@ type CommandRequest struct {
 type ShardStatus int
 
 const (
-	Servable     = iota // 不归该 Server 管理，或可提供服务
-	Pulling             // 该分片当前配置由该 Server 管理，但还未从上个配置中拉取，不可提供服务
-	WaitDeleting        // 该分片当前配置由该 Server 管理且可提供服务，但上个配置管理该分片的 Server 尚未删除（Pushing），可提供服务
-	Pushing             // 该分片当前配置不由该 Server 管理，但上个配置由该 Server 管理，不可提供服务
+	Servable          = iota // 归该 Server 管理且可提供服务
+	Pulling                  // 该分片当前配置由该 Server 管理，但还未从上个配置中拉取，不可提供服务
+	WaitOtherDeleting        // 该分片当前配置由该 Server 管理且可提供服务，但上个配置管理该分片的 Server 尚未删除（Pushing），可提供服务
+	Pushing                  // 该分片当前配置不由该 Server 管理，但上个配置由该 Server 管理，不可提供服务
+	Empty                    // 不归该 Server 管理，且已清空
 )
 
 // 存储 Server 管理一个 Shard 的内容
@@ -65,7 +66,7 @@ type awakeMsg struct {
 }
 
 type ShardKV struct {
-	mu           sync.Mutex
+	mu           *sync.RWMutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
@@ -79,7 +80,7 @@ type ShardKV struct {
 	mck *shardctrler.Clerk
 
 	currentCfg shardctrler.Config
-	futureCfg  shardctrler.Config // 迁移中时等待生效的配置
+	lastCfg    shardctrler.Config // 迁移中时上一份配置
 
 	shardMap         map[int]*Shard
 	waitMap          map[int]*OpContext // 用于唤醒等待 log id 的上下文
@@ -118,11 +119,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		kv.waitMap[index] = opCtx
 	}()
 	defer func() {
-		kv.mu.Lock()
-		defer kv.mu.Unlock()
-		if item := kv.waitMap[index]; item == opCtx {
-			delete(kv.waitMap, index)
-		}
+		go func() {
+			kv.mu.Lock()
+			defer kv.mu.Unlock()
+			if item := kv.waitMap[index]; item == opCtx {
+				delete(kv.waitMap, index)
+			}
+		}()
 	}()
 
 	// 2s 超时
@@ -178,11 +181,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.waitMap[index] = opCtx
 	}()
 	defer func() {
-		kv.mu.Lock()
-		defer kv.mu.Unlock()
-		if item := kv.waitMap[index]; item == opCtx {
-			delete(kv.waitMap, index)
-		}
+		go func() {
+			kv.mu.Lock()
+			defer kv.mu.Unlock()
+			if item := kv.waitMap[index]; item == opCtx {
+				delete(kv.waitMap, index)
+			}
+		}()
 	}()
 
 	// 2s 超时
@@ -267,6 +272,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	applyCh := make(chan raft.ApplyMsg)
 	kv := &ShardKV{
+		mu:               new(sync.RWMutex),
 		me:               me,
 		rf:               raft.Make(servers, me, persister, applyCh),
 		applyCh:          applyCh,
@@ -278,7 +284,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		persister:        persister,
 		mck:              shardctrler.MakeClerk(ctrlers),
 		currentCfg:       defaultConfig(gid),
-		futureCfg:        defaultConfig(gid),
+		lastCfg:          defaultConfig(gid),
 		shardMap:         defaultShardMap(),
 		waitMap:          map[int]*OpContext{}, // 用于唤醒等待 log id 的上下文
 		sequenceMap:      map[int64]int64{},    // 客户端的 sequence ID
@@ -292,7 +298,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		d.Decode(&kv.shardMap)
 		d.Decode(&kv.sequenceMap)
 		d.Decode(&kv.currentCfg)
-		d.Decode(&kv.futureCfg)
+		d.Decode(&kv.lastCfg)
 	}
 
 	go kv.applyRoutine()
@@ -306,7 +312,34 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	return kv
 }
 
+// 定时更新配置
 func (kv *ShardKV) pullLatestCfg() {
+	canPullLatest := true
+	for !kv.killed() {
+		kv.mu.RLock()
+		for _, shard := range kv.shardMap {
+			if shard.ShardStatus != Servable && shard.ShardStatus != Empty {
+				// 只有所有 shard 的状态都稳定才可以拉最新配置
+				canPullLatest = false
+				break
+			}
+		}
+		currentCfgNum := kv.currentCfg.Num
+		kv.mu.RUnlock()
+		if canPullLatest {
+			nextCfg := kv.mck.Query(currentCfgNum + 1)
+			if nextCfg.Num != currentCfgNum+1 {
+				continue
+			}
+			op := Op{
+				Type: OpTypeConfig,
+				Data: &nextCfg,
+			}
+
+			_, _, _ = kv.rf.Start(op)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (kv *ShardKV) pullShard() {
@@ -336,6 +369,8 @@ func (kv *ShardKV) applyRoutine() {
 				switch op.Type {
 				case OpTypeCommand:
 					aMsg = kv.applyCommand(op)
+				case OpTypeConfig:
+					aMsg = kv.applyConfig(op)
 				}
 
 				opCtx, hasWait := kv.waitMap[index]
@@ -365,15 +400,14 @@ func (kv *ShardKV) applyRoutine() {
 				d.Decode(&kv.shardMap)
 				d.Decode(&kv.sequenceMap)
 				d.Decode(&kv.currentCfg)
-				d.Decode(&kv.futureCfg)
+				d.Decode(&kv.lastCfg)
 			}()
 		}
 	}
 }
 
 func (kv *ShardKV) canServe(shard int) bool {
-	return kv.currentCfg.Shards[shard] == kv.gid &&
-		(kv.shardMap[shard].ShardStatus == Servable || kv.shardMap[shard].ShardStatus == WaitDeleting)
+	return kv.shardMap[shard].ShardStatus == Servable || kv.shardMap[shard].ShardStatus == WaitOtherDeleting
 }
 
 func (kv *ShardKV) applyCommand(rawOp Op) *awakeMsg {
@@ -420,19 +454,48 @@ func (kv *ShardKV) applyCommand(rawOp Op) *awakeMsg {
 	return aMsg
 }
 
+func (kv *ShardKV) applyConfig(rawOp Op) *awakeMsg {
+	res := &awakeMsg{}
+	cfg := rawOp.Data.(*shardctrler.Config)
+	if cfg == nil {
+		return res
+	}
+	if cfg.Num != kv.currentCfg.Num+1 {
+		return res
+	}
+	kv.updateShardStatusByCfg(cfg)
+	kv.lastCfg = kv.currentCfg
+	kv.currentCfg = *cfg
+	return res
+}
+
+func (kv *ShardKV) updateShardStatusByCfg(cfg *shardctrler.Config) {
+	// 根据新配置遍历全部 Shard 并更新状态
+	for shardID, shard := range kv.shardMap {
+		if cfg.Shards[shardID] == kv.gid && shard.ShardStatus == Empty {
+			// 应当由我负责的 shard 当前不由我负责
+			shard.ShardStatus = Pulling
+		}
+		if cfg.Shards[shardID] != kv.gid && shard.ShardStatus == Servable {
+			// 不应当由我负责的 shard 当前由我负责
+			shard.ShardStatus = Pushing
+		}
+	}
+}
+
 func (kv *ShardKV) snapshotRoutine() {
 	for !kv.killed() {
 		if kv.rf.ExceedSnapshotSize(kv.maxraftstate) {
-			kv.mu.Lock()
+			kv.mu.RLock()
 			w := new(bytes.Buffer)
 			e := labgob.NewEncoder(w)
 			e.Encode(kv.shardMap)
 			e.Encode(kv.sequenceMap)
 			e.Encode(kv.currentCfg)
-			e.Encode(kv.futureCfg)
+			e.Encode(kv.lastCfg)
 			snapshot := w.Bytes()
 			lastIncludedIndex := kv.lastAppliedIndex
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			kv.rf.Snapshot(lastIncludedIndex, snapshot)
 		}
 		time.Sleep(10 * time.Millisecond)
