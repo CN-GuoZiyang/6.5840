@@ -44,11 +44,10 @@ type CommandRequest struct {
 type ShardStatus int
 
 const (
-	Servable          = iota // 归该 Server 管理且可提供服务
+	Servable          = iota // 归该 Server 管理且可提供服务，或不归该 Server 管理
 	Pulling                  // 该分片当前配置由该 Server 管理，但还未从上个配置中拉取，不可提供服务
 	WaitOtherDeleting        // 该分片当前配置由该 Server 管理且可提供服务，但上个配置管理该分片的 Server 尚未删除（Pushing），可提供服务
 	Pushing                  // 该分片当前配置不由该 Server 管理，但上个配置由该 Server 管理，不可提供服务
-	Empty                    // 不归该 Server 管理，且已清空
 )
 
 // 存储 Server 管理一个 Shard 的内容
@@ -66,11 +65,10 @@ func (shard *Shard) copyStore() map[string]string {
 }
 
 type awakeMsg struct {
-	wrongLeader bool
-	wrongGroup  bool
-	ignored     bool
-	value       string
-	exist       bool
+	err     Err
+	ignored bool
+	value   string
+	exist   bool
 }
 
 type ShardKV struct {
@@ -113,7 +111,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	DPrintf("server %d get start %+v", kv.me, op)
+	// DPrintf("server %d get start %+v", kv.me, op)
 
 	opCtx := &OpContext{
 		origin: op,
@@ -141,16 +139,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	defer timer.Stop()
 	select {
 	case msg := <-opCtx.ok:
-		DPrintf("server %d get res %+v", kv.me, msg)
+		// DPrintf("server %d get res %+v", kv.me, msg)
 		reply.Value = msg.value
-		if msg.wrongLeader {
-			reply.Err = ErrWrongLeader
-		} else if !msg.exist {
-			reply.Err = ErrNoKey
-		}
-		if msg.wrongGroup {
-			reply.Err = ErrWrongGroup
-		}
+		reply.Err = msg.err
 	case <-timer.C:
 		reply.Err = ErrWrongLeader
 	}
@@ -175,7 +166,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	DPrintf("server %d put append start %+v", kv.me, op)
+	// DPrintf("server %d put append start %+v", kv.me, op)
 
 	opCtx := &OpContext{
 		origin: op,
@@ -203,15 +194,10 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	defer timer.Stop()
 	select {
 	case msg := <-opCtx.ok:
-		if msg.wrongLeader {
-			reply.Err = ErrWrongLeader
-		}
-		if msg.wrongGroup {
-			reply.Err = ErrWrongGroup
-		}
+		reply.Err = msg.err
 	case <-timer.C:
 		reply.Err = ErrWrongLeader
-		DPrintf("server %d timeout", kv.me)
+		// DPrintf("server %d timeout", kv.me)
 	}
 }
 
@@ -233,7 +219,7 @@ func (kv *ShardKV) killed() bool {
 func defaultConfig(gid int) shardctrler.Config {
 	return shardctrler.Config{
 		Num:    0,
-		Shards: [shardctrler.NShards]int{gid, gid, gid, gid, gid, gid, gid, gid, gid, gid},
+		Shards: [shardctrler.NShards]int{},
 		Groups: map[int][]string{},
 	}
 }
@@ -278,6 +264,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(Op{})
 	labgob.Register(CommandRequest{})
 	labgob.Register(&shardctrler.Config{})
+	labgob.Register(&ShardOpReply{})
+	labgob.Register(&ShardOpArgs{})
 
 	applyCh := make(chan raft.ApplyMsg)
 	kv := &ShardKV{
@@ -323,29 +311,36 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 // 定时更新配置
 func (kv *ShardKV) pullLatestCfg() {
-	canPullLatest := true
 	for !kv.killed() {
+		canPullLatest := true
+		_, isLeader := kv.rf.GetState()
 		kv.mu.RLock()
+		if !isLeader {
+			kv.mu.RUnlock()
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
 		for _, shard := range kv.shardMap {
-			if shard.ShardStatus != Servable && shard.ShardStatus != Empty {
+			if shard.ShardStatus != Servable {
 				// 只有所有 shard 的状态都稳定才可以拉最新配置
 				canPullLatest = false
-				break
+				time.Sleep(50 * time.Millisecond)
+				continue
 			}
 		}
 		currentCfgNum := kv.currentCfg.Num
 		kv.mu.RUnlock()
 		if canPullLatest {
 			nextCfg := kv.mck.Query(currentCfgNum + 1)
-			if nextCfg.Num != currentCfgNum+1 {
-				continue
+			if nextCfg.Num == currentCfgNum+1 {
+				DPrintf("gid %d: get latest cfg start %+v", kv.gid, nextCfg)
+				_, _, _ = kv.rf.Start(Op{
+					Type: OpTypeConfig,
+					Data: &nextCfg,
+				})
 			}
-			_, _, _ = kv.rf.Start(Op{
-				Type: OpTypeConfig,
-				Data: &nextCfg,
-			})
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -364,12 +359,13 @@ func (kv *ShardKV) pullShard() {
 			wg.Add(1)
 			go func(servers []string, configNum int, shardIDs []int) {
 				defer wg.Done()
-				req := AcquireShardArgs{
+				req := ShardOpArgs{
 					ShardIDs:  shardIDs,
 					ConfigNum: configNum,
 				}
+				DPrintf("gid %d: get shards %+v", kv.gid, shardIDs)
 				for _, server := range servers {
-					var resp AcquireShardReply
+					var resp ShardOpReply
 					srv := kv.make_end(server)
 					if srv.Call("ShardKV.GetShards", &req, &resp) && resp.Err == OK {
 						_, _, _ = kv.rf.Start(Op{
@@ -382,11 +378,11 @@ func (kv *ShardKV) pullShard() {
 		}
 		kv.mu.RUnlock()
 		wg.Wait()
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(80 * time.Millisecond)
 	}
 }
 
-func (kv *ShardKV) GetShards(req *AcquireShardArgs, resp *AcquireShardReply) {
+func (kv *ShardKV) GetShards(req *ShardOpArgs, resp *ShardOpReply) {
 	resp.Err = OK
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		resp.Err = ErrWrongLeader
@@ -410,6 +406,97 @@ func (kv *ShardKV) GetShards(req *AcquireShardArgs, resp *AcquireShardReply) {
 }
 
 func (kv *ShardKV) deleteShard() {
+	for !kv.killed() {
+		kv.mu.RLock()
+		gid2ShardIDs := map[int][]int{}
+		for shardID, shard := range kv.shardMap {
+			if shard.ShardStatus == WaitOtherDeleting {
+				gid := kv.lastCfg.Shards[shardID]
+				gid2ShardIDs[gid] = append(gid2ShardIDs[gid], shardID)
+			}
+		}
+		var wg sync.WaitGroup
+		for gid, shardIDs := range gid2ShardIDs {
+			wg.Add(1)
+			go func(servers []string, configNum int, shardIDs []int) {
+				defer wg.Done()
+				req := ShardOpArgs{
+					ShardIDs:  shardIDs,
+					ConfigNum: configNum,
+				}
+				for _, server := range servers {
+					var resp ShardOpReply
+					srv := kv.make_end(server)
+					if srv.Call("ShardKV.DeleteShards", &req, &resp) && resp.Err == OK {
+						DPrintf("gid %v: delete others shards %+v", kv.gid, shardIDs)
+						_, _, _ = kv.rf.Start(Op{
+							Type: OpTypeDeleteShard,
+							Data: &req,
+						})
+					}
+				}
+			}(kv.lastCfg.Groups[gid], kv.currentCfg.Num, shardIDs)
+		}
+		kv.mu.RUnlock()
+		wg.Wait()
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) DeleteShards(req *ShardOpArgs, resp *ShardOpReply) {
+	resp.Err = OK
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		resp.Err = ErrWrongLeader
+		return
+	}
+	kv.mu.RLock()
+	if kv.currentCfg.Num > req.ConfigNum {
+		kv.mu.RUnlock()
+		return
+	}
+	kv.mu.RUnlock()
+
+	DPrintf("gid %v: delete shards %+v start", kv.gid, req.ShardIDs)
+	op := Op{
+		Type: OpTypeDeleteShard,
+		Data: req,
+	}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		resp.Err = ErrWrongLeader
+		return
+	}
+	opCtx := &OpContext{
+		origin: op,
+		index:  index,
+		term:   term,
+		ok:     make(chan awakeMsg),
+	}
+	func() {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		kv.waitMap[index] = opCtx
+	}()
+	defer func() {
+		go func() {
+			kv.mu.Lock()
+			defer kv.mu.Unlock()
+			if item := kv.waitMap[index]; item == opCtx {
+				delete(kv.waitMap, index)
+			}
+		}()
+	}()
+
+	// 2s 超时
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case msg := <-opCtx.ok:
+		resp.Err = msg.err
+	case <-timer.C:
+		resp.Err = ErrWrongLeader
+		// DPrintf("server %d timeout", kv.me)
+	}
 }
 
 func (kv *ShardKV) applyRoutine() {
@@ -437,6 +524,8 @@ func (kv *ShardKV) applyRoutine() {
 					aMsg = kv.applyConfig(op)
 				case OpTypeInsertShard:
 					aMsg = kv.applyInsertShard(op)
+				case OpTypeDeleteShard:
+					aMsg = kv.applyDeleteShard(op)
 				}
 
 				opCtx, hasWait := kv.waitMap[index]
@@ -444,9 +533,9 @@ func (kv *ShardKV) applyRoutine() {
 					return
 				}
 				if opCtx.term != msgTerm {
-					aMsg.wrongLeader = true
+					aMsg.err = ErrWrongLeader
 				}
-				DPrintf("server %d apply res %+v", kv.me, aMsg)
+				// DPrintf("server %d apply res %+v", kv.me, aMsg)
 				opCtx.ok <- *aMsg
 				close(opCtx.ok)
 			}()
@@ -473,17 +562,17 @@ func (kv *ShardKV) applyRoutine() {
 }
 
 func (kv *ShardKV) canServe(shard int) bool {
-	return kv.shardMap[shard].ShardStatus == Servable || kv.shardMap[shard].ShardStatus == WaitOtherDeleting
+	return kv.currentCfg.Shards[shard] == kv.gid && (kv.shardMap[shard].ShardStatus == Servable || kv.shardMap[shard].ShardStatus == WaitOtherDeleting)
 }
 
 func (kv *ShardKV) applyCommand(rawOp Op) *awakeMsg {
 	op := rawOp.Data.(CommandRequest)
 	shard := key2shard(op.Key)
 	if !kv.canServe(shard) {
-		return &awakeMsg{wrongGroup: true}
+		return &awakeMsg{err: ErrWrongGroup}
 	}
 
-	aMsg := &awakeMsg{}
+	aMsg := &awakeMsg{err: OK}
 	prevSeq, existSeq := kv.sequenceMap[op.ClientID]
 	kv.sequenceMap[op.ClientID] = op.SequenceID
 
@@ -499,7 +588,7 @@ func (kv *ShardKV) applyCommand(rawOp Op) *awakeMsg {
 		return aMsg
 	}
 
-	DPrintf("server %d apply %+v", kv.me, op)
+	// DPrintf("server %d apply %+v", kv.me, op)
 
 	// Put 操作
 	if op.Type == "Put" {
@@ -521,31 +610,32 @@ func (kv *ShardKV) applyCommand(rawOp Op) *awakeMsg {
 }
 
 func (kv *ShardKV) applyConfig(rawOp Op) *awakeMsg {
-	res := &awakeMsg{}
+	res := &awakeMsg{err: OK}
 	cfg := rawOp.Data.(*shardctrler.Config)
 	if cfg == nil {
+		DPrintf("gid %d: get latest cfg failed", kv.gid)
 		return res
 	}
 	if cfg.Num != kv.currentCfg.Num+1 {
+		DPrintf("gid %d: get latest cfg failed - %v vs %v", kv.gid, cfg.Num, kv.currentCfg.Num)
 		return res
 	}
-	kv.updateShardStatusByCfg(cfg)
+	kv.updateShardStatusByCfg(cfg, &kv.currentCfg)
+	DPrintf("gid %d: get latest cfg success %+v", kv.gid, cfg)
 	kv.lastCfg = kv.currentCfg
 	kv.currentCfg = *cfg
 	return res
 }
 
 func (kv *ShardKV) applyInsertShard(rawOp Op) *awakeMsg {
-	res := &awakeMsg{}
-	reply := rawOp.Data.(*AcquireShardReply)
+	res := &awakeMsg{err: OK}
+	reply := rawOp.Data.(*ShardOpReply)
 	if reply.ConfigNum != kv.currentCfg.Num {
 		return res
 	}
+	DPrintf("gid %v: get shards success", kv.gid)
 	for shardID, store := range reply.Store {
 		shard := kv.shardMap[shardID]
-		if shard.ShardStatus != Pulling {
-			break
-		}
 		for k, v := range store {
 			shard.Store[k] = v
 		}
@@ -560,15 +650,35 @@ func (kv *ShardKV) applyInsertShard(rawOp Op) *awakeMsg {
 	return res
 }
 
-func (kv *ShardKV) updateShardStatusByCfg(cfg *shardctrler.Config) {
+func (kv *ShardKV) applyDeleteShard(rawOp Op) *awakeMsg {
+	res := &awakeMsg{err: OK}
+	req := rawOp.Data.(*ShardOpArgs)
+	if req.ConfigNum != kv.currentCfg.Num {
+		return res
+	}
+	for _, shardID := range req.ShardIDs {
+		shard := kv.shardMap[shardID]
+		if shard.ShardStatus == WaitOtherDeleting {
+			// DPrintf("gid %v: delete other shard %v success", kv.gid, shardID)
+			shard.ShardStatus = Servable
+		} else if shard.ShardStatus == Pushing {
+			// DPrintf("gid %v: delete my shard %v success", kv.gid, shardID)
+			shard.ShardStatus = Servable
+			shard.Store = map[string]string{}
+		}
+	}
+	return res
+}
+
+func (kv *ShardKV) updateShardStatusByCfg(cfg, lastCfg *shardctrler.Config) {
 	// 根据新配置遍历全部 Shard 并更新状态
 	for shardID, shard := range kv.shardMap {
-		if cfg.Shards[shardID] == kv.gid && shard.ShardStatus == Empty {
-			// 应当由我负责的 shard 当前不由我负责
+		if cfg.Shards[shardID] == kv.gid && lastCfg.Num != 0 && lastCfg.Shards[shardID] != kv.gid {
+			// DPrintf("gid %v: need pull %v", kv.gid, shardID)
 			shard.ShardStatus = Pulling
 		}
-		if cfg.Shards[shardID] != kv.gid && shard.ShardStatus == Servable {
-			// 不应当由我负责的 shard 当前由我负责
+		if cfg.Shards[shardID] != kv.gid && lastCfg.Num != 0 && lastCfg.Shards[shardID] == kv.gid {
+			// DPrintf("gid %v: need push %v", kv.gid, shardID)
 			shard.ShardStatus = Pushing
 		}
 	}

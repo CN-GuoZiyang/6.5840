@@ -45,12 +45,12 @@ type GetReply struct {
 	Value string
 }
 
-type AcquireShardArgs struct {
+type ShardOpArgs struct {
 	ShardIDs  []int
 	ConfigNum int
 }
 
-type AcquireShardReply struct {
+type ShardOpReply struct {
 	Err         Err
 	Store       map[int]map[string]string
 	SequenceMap map[int64]int64
