@@ -57,6 +57,14 @@ type Shard struct {
 	Store       map[string]string // Shard 实际存储
 }
 
+func (shard *Shard) copyStore() map[string]string {
+	res := map[string]string{}
+	for k, v := range shard.Store {
+		res[k] = v
+	}
+	return res
+}
+
 type awakeMsg struct {
 	wrongLeader bool
 	wrongGroup  bool
@@ -332,18 +340,73 @@ func (kv *ShardKV) pullLatestCfg() {
 			if nextCfg.Num != currentCfgNum+1 {
 				continue
 			}
-			op := Op{
+			_, _, _ = kv.rf.Start(Op{
 				Type: OpTypeConfig,
 				Data: &nextCfg,
-			}
-
-			_, _, _ = kv.rf.Start(op)
+			})
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 }
 
 func (kv *ShardKV) pullShard() {
+	for !kv.killed() {
+		kv.mu.RLock()
+		gid2ShardIDs := map[int][]int{}
+		for shardID, shard := range kv.shardMap {
+			if shard.ShardStatus == Pulling {
+				gid := kv.lastCfg.Shards[shardID]
+				gid2ShardIDs[gid] = append(gid2ShardIDs[gid], shardID)
+			}
+		}
+		var wg sync.WaitGroup
+		for gid, shardIDs := range gid2ShardIDs {
+			wg.Add(1)
+			go func(servers []string, configNum int, shardIDs []int) {
+				defer wg.Done()
+				req := AcquireShardArgs{
+					ShardIDs:  shardIDs,
+					ConfigNum: configNum,
+				}
+				for _, server := range servers {
+					var resp AcquireShardReply
+					srv := kv.make_end(server)
+					if srv.Call("ShardKV.GetShards", &req, &resp) && resp.Err == OK {
+						_, _, _ = kv.rf.Start(Op{
+							Type: OpTypeInsertShard,
+							Data: &resp,
+						})
+					}
+				}
+			}(kv.lastCfg.Groups[gid], kv.currentCfg.Num, shardIDs)
+		}
+		kv.mu.RUnlock()
+		wg.Wait()
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) GetShards(req *AcquireShardArgs, resp *AcquireShardReply) {
+	resp.Err = OK
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		resp.Err = ErrWrongLeader
+		return
+	}
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	if kv.currentCfg.Num < req.ConfigNum {
+		resp.Err = ErrCfgNotReady
+		return
+	}
+	resp.Store = map[int]map[string]string{}
+	for _, shardID := range req.ShardIDs {
+		resp.Store[shardID] = kv.shardMap[shardID].copyStore()
+	}
+	resp.SequenceMap = map[int64]int64{}
+	for clientID, sequenceID := range kv.sequenceMap {
+		resp.SequenceMap[clientID] = sequenceID
+	}
+	resp.ConfigNum = req.ConfigNum
 }
 
 func (kv *ShardKV) deleteShard() {
@@ -372,6 +435,8 @@ func (kv *ShardKV) applyRoutine() {
 					aMsg = kv.applyCommand(op)
 				case OpTypeConfig:
 					aMsg = kv.applyConfig(op)
+				case OpTypeInsertShard:
+					aMsg = kv.applyInsertShard(op)
 				}
 
 				opCtx, hasWait := kv.waitMap[index]
@@ -467,6 +532,31 @@ func (kv *ShardKV) applyConfig(rawOp Op) *awakeMsg {
 	kv.updateShardStatusByCfg(cfg)
 	kv.lastCfg = kv.currentCfg
 	kv.currentCfg = *cfg
+	return res
+}
+
+func (kv *ShardKV) applyInsertShard(rawOp Op) *awakeMsg {
+	res := &awakeMsg{}
+	reply := rawOp.Data.(*AcquireShardReply)
+	if reply.ConfigNum != kv.currentCfg.Num {
+		return res
+	}
+	for shardID, store := range reply.Store {
+		shard := kv.shardMap[shardID]
+		if shard.ShardStatus != Pulling {
+			break
+		}
+		for k, v := range store {
+			shard.Store[k] = v
+		}
+		shard.ShardStatus = WaitOtherDeleting
+	}
+	for clientID, seqID := range reply.SequenceMap {
+		if currentSeqID, ok := kv.sequenceMap[clientID]; !ok ||
+			currentSeqID < seqID {
+			kv.sequenceMap[clientID] = seqID
+		}
+	}
 	return res
 }
 

@@ -16,6 +16,7 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrCfgNotReady = "ErrCfgNotReady"
 )
 
 type Err string
@@ -45,15 +46,15 @@ type GetReply struct {
 }
 
 type AcquireShardArgs struct {
-	ShardNum  int
+	ShardIDs  []int
 	ConfigNum int
 }
 
 type AcquireShardReply struct {
-	WrongLeader bool
 	Err         Err
-	Store       map[string]string
+	Store       map[int]map[string]string
 	SequenceMap map[int64]int64
+	ConfigNum   int
 }
 
 const Debug = false
